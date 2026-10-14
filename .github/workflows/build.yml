@@ -5,6 +5,11 @@ on:
   push:
     branches:
       - main
+  repository_dispatch:
+    types:
+      - data-release
+  schedule:
+    - cron: "0 0 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,6 +22,7 @@ jobs:
   build:
     name: Build release APKs
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'repository_dispatch' || github.event.action == 'data-release' }}
 
     steps:
       - name: Checkout repository
