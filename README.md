@@ -1,6 +1,7 @@
 # Hoshimi Localify EN
 
 ## [Submit Bug Reports Here](https://forms.gle/TZDMAieKvuFLf5ru7)
+## [Submit your own translations here](https://hoshimistation.tokanada.com)
 
 English translation module for **Idol Pride** (LSPatch). This repository builds and
 releases the module app; users patch their own game — no patched game is distributed here.
