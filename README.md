@@ -26,7 +26,7 @@ This is a **modified derivative** of Hoshimi Localify (GPL-3.0) — see *Upstrea
   over wireless debugging).
 - **The module APK** from this repo's [releases](../../releases):
   `HoshimiLocalify-en-lite-<ver>.apk` (recommended) or
-  `HoshimiLocalify-en-full-<ver>.apk` (adds the breast-physics parameters).
+  `HoshimiLocalify-en-full-<ver>.apk` (adds the breast-physics parameters). Each data release produces its own GitHub release tagged `<versionName>-data.<data tag>` (newest 7 kept).
 - ~40 MB of free storage for the translation data, plus room for the patched game.
 - An internet connection.
 

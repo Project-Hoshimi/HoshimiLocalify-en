@@ -11,4 +11,4 @@ The private fork is the source of truth. To publish a code update:
    the new tag.
 
 The data payload is not stored here: the build workflow downloads the latest
-`tokanada/ipr-translation-data-en` release before building.
+`tokanada/ipr-translation-data-en` release before building. Each data release produces its own GitHub release tagged `<versionName>-data.<data tag>` (newest 7 kept).

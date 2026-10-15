@@ -12,8 +12,8 @@ on:
     - cron: "0 0 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: module-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -58,16 +58,37 @@ jobs:
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
 
       - name: Fetch EN translation data
+        id: data
         run: |
+          set -euo pipefail
           ver="$(curl -sS https://api.github.com/repos/tokanada/ipr-translation-data-en/releases/latest | jq -r .tag_name)"
-          curl -L -o /tmp/en.zip "https://github.com/tokanada/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
+          if [ -z "$ver" ] || [ "$ver" = "null" ]; then echo "Could not read latest data release tag" >&2; exit 1; fi
+          curl -fL -o /tmp/en.zip "https://github.com/tokanada/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
           mkdir -p app/src/main/assets/hoshimi-local
           unzip -qo /tmp/en.zip -d app/src/main/assets/hoshimi-local
+          echo "data_tag=$ver" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${{ steps.app_version.outputs.version_name }}-data.$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this module+data release already exists
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.data.outputs.release_tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+             && [ "${{ github.event_name }}" != "push" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Release $tag already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Grant execute permission for Gradle wrapper
+        if: steps.gate.outputs.skip != 'true'
         run: chmod +x gradlew
 
       - name: Restore release keystore
+        if: steps.gate.outputs.skip != 'true'
         env:
           HOSHIMI_RELEASE_KEYSTORE_BASE64: ${{ secrets.HOSHIMI_RELEASE_KEYSTORE_BASE64 }}
         run: |
@@ -76,6 +97,7 @@ jobs:
           fi
 
       - name: Build APKs
+        if: steps.gate.outputs.skip != 'true'
         env:
           HOSHIMI_RELEASE_STORE_FILE: release.keystore
           HOSHIMI_RELEASE_STORE_PASSWORD: ${{ secrets.HOSHIMI_RELEASE_STORE_PASSWORD }}
@@ -84,24 +106,42 @@ jobs:
         run: ./gradlew clean assembleRelease
 
       - name: Rename APKs
+        if: steps.gate.outputs.skip != 'true'
         run: |
-          v="${{ steps.app_version.outputs.version_name }}"
-          mv app/build/outputs/apk/full/release/app-full-release.apk "HoshimiLocalify-en-full-$v.apk"
-          mv app/build/outputs/apk/lite/release/app-lite-release.apk "HoshimiLocalify-en-lite-$v.apk"
+          t="${{ steps.data.outputs.release_tag }}"
+          mv app/build/outputs/apk/full/release/app-full-release.apk "HoshimiLocalify-en-full-$t.apk"
+          mv app/build/outputs/apk/lite/release/app-lite-release.apk "HoshimiLocalify-en-lite-$t.apk"
 
-      - name: Create or update version tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          tag_name="${{ steps.app_version.outputs.version_name }}"
-          git fetch --tags
-          git tag -f "$tag_name" "$GITHUB_SHA"
-          git push -f origin "$tag_name"
-
-      - name: Upload APKs to GitHub Release
+      - name: Publish release
+        if: steps.gate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          t="${{ steps.data.outputs.release_tag }}"
           v="${{ steps.app_version.outputs.version_name }}"
-          gh release view "$v" >/dev/null 2>&1 || gh release create "$v" --title "$v" --notes ""
-          gh release upload "$v" "HoshimiLocalify-en-full-$v.apk" "HoshimiLocalify-en-lite-$v.apk" --clobber
+          d="${{ steps.data.outputs.data_tag }}"
+          notes="Module $v with translation data $d (commit $GITHUB_SHA)."
+          files=("HoshimiLocalify-en-full-$t.apk" "HoshimiLocalify-en-lite-$t.apk")
+          if gh release view "$t" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$t" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$t" --repo "$GITHUB_REPOSITORY" --notes "$notes" --latest
+          else
+            gh release create "$t" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$t" --notes "$notes" --latest
+          fi
+
+      - name: Prune old data releases (keep newest 7)
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | contains("-data."))] | sort_by(.createdAt) | reverse | .[7:] | .[].tagName' \
+          | while read -r old; do
+              case "$old" in
+                *-data.*) echo "Deleting old release $old"; gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes ;;
+                *) echo "Refusing to delete $old" >&2; exit 1 ;;
+              esac
+            done
