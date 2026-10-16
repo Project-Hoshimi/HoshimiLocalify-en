@@ -1673,40 +1673,142 @@ namespace HoshimiLocal::HookMain {
             float fit = rectW / ((float)longest * kAdvanceEm);
             if (fit < target) target = fit;
         }
+        // Height cap: the caption rect is one row tall by design, so a 2nd
+        // row at near-full size runs into the speaker label below. Cap
+        // multi-row captions at a fixed size that clears the label.
+        const float kMultiRowMax = 38.0f;
+        const size_t rows = 1 + std::count(text.begin(), text.end(), '\n');
+        if (rows >= 2 && target > kMultiRowMax) target = kMultiRowMax;
         if (target < kMinSize) target = kMinSize;
         if (set_enableAutoSizing) set_enableAutoSizing->Invoke<void>(textComponent, false);
         if (set_fontSize) set_fontSize->Invoke<void>(textComponent, target);
         static int capLogged = 0;
         if (capLogged < 300) {
-            Log::InfoFmt("[CaptionFit] design=%.1f rectW=%.1f perLine=%zu longest=%zu target=%.1f text=%.70s",
-                         design, rectW, perLine, longest, target, text.c_str());
+            Log::InfoFmt("[CaptionFit] design=%.1f rectW=%.1f rows=%zu perLine=%zu longest=%zu target=%.1f text=%.70s",
+                         design, rectW, rows, perLine, longest, target, text.c_str());
             ++capLogged;
         }
+    }
+
+    // Shared by the log cell text fit and the log list cell-height hook.
+    static void RepairLogCellBreaks(std::string& text) {
+        if (text.find(' ') == std::string::npos) return;
+        // Repair engine-copied layout breaks: log cells receive the live
+        // bubble's laid-out lines WITH hard breaks. The engine emits both
+        // mid-word splits ("su\ndden") and spaceless word-boundary splits
+        // ("to\nbe", "not\nofficial"), so spacing alone can't tell them apart.
+        // Drop a '\n' only when the current line already reached layout length
+        // (>=15 text chars); then join with "" only when the merged token is a
+        // known story word while the two fragments aren't both known words
+        // (len>1) — else join with " ". Short lines keep breaks (translator
+        // intent). Latin sentences only (require an ASCII space) so JP
+        // intentional breaks are never touched.
+        std::string fixed;
+        fixed.reserve(text.size());
+        size_t lineLen = 0;
+        bool inTag = false;
+        auto isAsciiLetter = [](char ch) {
+            return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        };
+        auto lowerAscii = [](std::string s) {
+            for (char& ch : s) if (ch >= 'A' && ch <= 'Z') ch += (char)('a' - 'A');
+            return s;
+        };
+        for (size_t i = 0; i < text.size(); ++i) {
+            char c = text[i];
+            if (c == '<') inTag = true;
+            if (c == '\n') {
+                inTag = false;
+                size_t j = i + 1;
+                while (j < text.size() && (text[j] == ' ' || text[j] == '\r')) ++j;
+                char prev = fixed.empty() ? 0 : fixed.back();
+                char next = (j < text.size()) ? text[j] : 0;
+                if (lineLen >= 15 && next != 0) {
+                    if (prev == ' ') {
+                        // space already present: add nothing (skip duplicates)
+                    } else if (isAsciiLetter(prev) && isAsciiLetter(next)) {
+                        size_t a = fixed.size();
+                        while (a > 0 && isAsciiLetter(fixed[a - 1])) --a;
+                        size_t b = j;
+                        while (b < text.size() && isAsciiLetter(text[b])) ++b;
+                        std::string fragA = lowerAscii(fixed.substr(a));
+                        std::string fragB = lowerAscii(text.substr(j, b - j));
+                        bool mergedKnown = StoryWordKnown(fragA + fragB);
+                        if (!mergedKnown) fixed += ' ';
+                        // else mid-word split: join with "" (add nothing).
+                        // (Deliberately no both-parts-known exception: spaceless
+                        // breaks are overwhelmingly engine mid-word char-splits,
+                        // and short fragments like "ne"/"ed" pollute the dict —
+                        // "ne|ed" was mis-spaced to "ne ed", and the layout then
+                        // split at that inserted space. Genuine boundary splits
+                        // keep their space via prev==' ', or stay spaceless but
+                        // unmerged like "to|be" -> "to be".)
+                    } else {
+                        fixed += ' ';
+                    }
+                    // joined line continues (no lineLen reset)
+                } else if (next == 0) {
+                    // trailing break: drop
+                } else {
+                    fixed += '\n';
+                    lineLen = 0;
+                }
+                i = j - 1;
+                continue;
+            }
+            fixed += c;
+            if (!inTag && (c & 0xC0) != 0x80) ++lineLen;
+            if (c == '>') inTag = false;
+        }
+        text.swap(fixed);
     }
 
     // Story log bubble. Its rect is content-sized (0 on first bind, then varies
     // with the text), so it is NOT used: fixed char budgets measured on device
     // (~36 chars fit at full size, ~0.55em advance @ design 40).
-    static void FitStoryLogCell(void* textComponent, bool hadTag, std::string& text) {
+    // The log list sizes each cell from StoryLogListItemModel.get_LineCount,
+    // which only has heights for 1-3 lines, so the layout never exceeds 3
+    // (an overlong text is rebalanced into 3 lines and shrunk by the fit).
+    static const size_t kLogMaxLines = 3;
+
+    // Breaks long segments of a (repaired) log text; returns the line count.
+    static size_t LayoutLogCellLines(std::string& text) {
         const size_t kSplitAbove = 38; // segments longer than this get broken
         const size_t kPerLine = 34;    // target chars per line when breaking
-        const float kFullFit = 36.0f;  // longest line that fits at 100%
-        if (!hadTag) {
-            std::string laid;
-            size_t segStart = 0;
-            for (size_t i = 0; i <= text.size(); ++i) {
-                if (i == text.size() || text[i] == '\n') {
-                    std::string seg = text.substr(segStart, i - segStart);
-                    size_t chars = Utf8CharCount(seg);
-                    if (chars > kSplitAbove)
-                        seg = SplitLineBalanced(seg, (chars + kPerLine - 1) / kPerLine);
-                    laid += seg;
-                    if (i < text.size()) laid += '\n';
-                    segStart = i + 1;
+        std::string laid;
+        size_t lines = 1;
+        size_t segStart = 0;
+        for (size_t i = 0; i <= text.size(); ++i) {
+            if (i == text.size() || text[i] == '\n') {
+                std::string seg = text.substr(segStart, i - segStart);
+                size_t chars = Utf8CharCount(seg);
+                if (chars > kSplitAbove)
+                    seg = SplitLineBalanced(seg, (chars + kPerLine - 1) / kPerLine);
+                laid += seg;
+                if (i < text.size()) laid += '\n';
+                segStart = i + 1;
+            }
+        }
+        lines = 1 + std::count(laid.begin(), laid.end(), '\n');
+        if (lines > kLogMaxLines) {
+            std::string joined;
+            for (char c : laid) {
+                if (c == '\n') {
+                    if (!joined.empty() && joined.back() != ' ') joined += ' ';
+                } else {
+                    joined += c;
                 }
             }
-            text.swap(laid);
+            laid = SplitLineBalanced(joined, kLogMaxLines);
+            lines = 1 + std::count(laid.begin(), laid.end(), '\n');
         }
+        text.swap(laid);
+        return lines;
+    }
+
+    static void FitStoryLogCell(void* textComponent, bool hadTag, std::string& text) {
+        const float kFullFit = 36.0f;  // longest line that fits at 100%
+        if (!hadTag) LayoutLogCellLines(text);
         size_t longest = LongestLineChars(text);
         float scale = 1.0f;
         if (longest > 0) {
@@ -1756,76 +1858,7 @@ namespace HoshimiLocal::HookMain {
                 text.erase(text.size() - closeTag.size());
             }
         }
-        if (isLogCell && !hadTag && text.find(' ') != std::string::npos) {
-            // Repair engine-copied layout breaks: log cells receive the live
-            // bubble's laid-out lines WITH hard breaks. The engine emits both
-            // mid-word splits ("su\ndden") and spaceless word-boundary splits
-            // ("to\nbe", "not\nofficial"), so spacing alone can't tell them apart.
-            // Drop a '\n' only when the current line already reached layout length
-            // (>=15 text chars); then join with "" only when the merged token is a
-            // known story word while the two fragments aren't both known words
-            // (len>1) — else join with " ". Short lines keep breaks (translator
-            // intent). Latin sentences only (require an ASCII space) so JP
-            // intentional breaks are never touched.
-            std::string fixed;
-            fixed.reserve(text.size());
-            size_t lineLen = 0;
-            bool inTag = false;
-            auto isAsciiLetter = [](char ch) {
-                return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
-            };
-            auto lowerAscii = [](std::string s) {
-                for (char& ch : s) if (ch >= 'A' && ch <= 'Z') ch += (char)('a' - 'A');
-                return s;
-            };
-            for (size_t i = 0; i < text.size(); ++i) {
-                char c = text[i];
-                if (c == '<') inTag = true;
-                if (c == '\n') {
-                    inTag = false;
-                    size_t j = i + 1;
-                    while (j < text.size() && (text[j] == ' ' || text[j] == '\r')) ++j;
-                    char prev = fixed.empty() ? 0 : fixed.back();
-                    char next = (j < text.size()) ? text[j] : 0;
-                    if (lineLen >= 15 && next != 0) {
-                        if (prev == ' ') {
-                            // space already present: add nothing (skip duplicates)
-                        } else if (isAsciiLetter(prev) && isAsciiLetter(next)) {
-                            size_t a = fixed.size();
-                            while (a > 0 && isAsciiLetter(fixed[a - 1])) --a;
-                            size_t b = j;
-                            while (b < text.size() && isAsciiLetter(text[b])) ++b;
-                            std::string fragA = lowerAscii(fixed.substr(a));
-                            std::string fragB = lowerAscii(text.substr(j, b - j));
-                            bool mergedKnown = StoryWordKnown(fragA + fragB);
-                            if (!mergedKnown) fixed += ' ';
-                            // else mid-word split: join with "" (add nothing).
-                            // (Deliberately no both-parts-known exception: spaceless
-                            // breaks are overwhelmingly engine mid-word char-splits,
-                            // and short fragments like "ne"/"ed" pollute the dict —
-                            // "ne|ed" was mis-spaced to "ne ed", and the layout then
-                            // split at that inserted space. Genuine boundary splits
-                            // keep their space via prev==' ', or stay spaceless but
-                            // unmerged like "to|be" -> "to be".)
-                        } else {
-                            fixed += ' ';
-                        }
-                        // joined line continues (no lineLen reset)
-                    } else if (next == 0) {
-                        // trailing break: drop
-                    } else {
-                        fixed += '\n';
-                        lineLen = 0;
-                    }
-                    i = j - 1;
-                    continue;
-                }
-                fixed += c;
-                if (!inTag && (c & 0xC0) != 0x80) ++lineLen;
-                if (c == '>') inTag = false;
-            }
-            text.swap(fixed);
-        }
+        if (isLogCell && !hadTag) RepairLogCellBreaks(text);
         if (isDetailSheet) {
             // Episode detail page (pre-story sheet): these boxes clip/overlap
             // instead of growing, so force TMP autosize (max=design, min=30%)
@@ -1958,6 +1991,34 @@ namespace HoshimiLocal::HookMain {
         set_resizeTextForBestFit->Invoke<void>(textComponent, true);
         set_resizeTextMaxSize->Invoke<void>(textComponent, 64);
         set_resizeTextMinSize->Invoke<void>(textComponent, 8);
+    }
+
+    // StoryLogListItemModel sizes each log cell from get_LineCount
+    // (Text.Length/19+1), which only has heights for 2-3 lines; English text
+    // would get the 1-line height while we draw up to 3 lines. Report the
+    // line count we actually lay out.
+    DEFINE_HOOK(int, StoryLogListItemModel_get_LineCount, (void* self, void* mtd)) {
+        int orig = StoryLogListItemModel_get_LineCount_Orig(self, mtd);
+        if (!self) return orig;
+        auto* str = *reinterpret_cast<Il2cppString**>(reinterpret_cast<uintptr_t>(self) + 0x18);
+        if (!str) return orig;
+        std::string text = str->ToString();
+        if (text.find(' ') == std::string::npos) return orig; // JP: keep engine count
+        if (text.compare(0, 6, "<size=") == 0) {
+            auto gt = text.find('>');
+            if (gt != std::string::npos) text.erase(0, gt + 1);
+            auto tail = text.rfind("</size>");
+            if (tail != std::string::npos) text.erase(tail);
+        }
+        RepairLogCellBreaks(text);
+        size_t lines = LayoutLogCellLines(text);
+        int ours = (int)std::min(std::max<size_t>(lines, 1), kLogMaxLines);
+        static int lcLogged = 0;
+        if (lcLogged < 40) {
+            Log::InfoFmt("[LogLineCount] orig=%d ours=%d text=%.60s", orig, ours, text.c_str());
+            ++lcLogged;
+        }
+        return ours;
     }
 
     void ApplyCenterTextLayout(void* textComponent) {
@@ -5481,6 +5542,17 @@ namespace HoshimiLocal::HookMain {
             ADD_HOOK(ADVEnginePresenterBase_get_UserName, advUserNameMethod->methodPointer);
         } else {
             Log::Error("ADVEnginePresenterBase.get_UserName not found");
+        }
+        auto storyLogModelClass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.OutGame",
+                                                        "StoryLogListItemModel");
+        auto storyLogLineCountMethod = storyLogModelClass
+                ? Il2cppUtils::il2cpp_class_get_method_from_name(storyLogModelClass->address,
+                                                                 "get_LineCount", 0)
+                : nullptr;
+        if (storyLogLineCountMethod) {
+            ADD_HOOK(StoryLogListItemModel_get_LineCount, storyLogLineCountMethod->methodPointer);
+        } else {
+            Log::Error("StoryLogListItemModel.get_LineCount not found");
         }
         ADD_HOOK(MessageDetail_GetReplacedMessage, Il2cppUtils::GetMethodPointer(
                 "Assembly-CSharp.dll", "Solis.Common.Proto.Master", "MessageDetail",
