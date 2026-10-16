@@ -6,6 +6,7 @@
 
     <queries>
         <package android:name="game.qualiarts.idolypride" />
+        <package android:name="game.qualiarts.idolypride_en" />
     </queries>
 
     <application

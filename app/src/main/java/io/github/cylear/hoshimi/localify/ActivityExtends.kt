@@ -108,8 +108,9 @@ fun <T> T.updateCurrentResourceVersionForGameStart() where T : Activity, T : IHa
     }
 }
 
-fun <T> T.onClickStartGame() where T : Activity, T : IHasConfigItems {
-    val gamePackageName = TargetGamePackages.findInstalled(this)
+fun <T> T.onClickStartGame(requestedPackage: String? = null) where T : Activity, T : IHasConfigItems {
+    val gamePackageName = requestedPackage?.takeIf { it in TargetGamePackages.all }
+        ?: TargetGamePackages.findInstalled(this)
     if (gamePackageName == null) {
         Toast.makeText(this, "Game package not found.", Toast.LENGTH_SHORT).show()
         return

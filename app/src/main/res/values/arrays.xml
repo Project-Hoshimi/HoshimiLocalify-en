@@ -2,5 +2,6 @@
 <resources>
     <string-array name="xposed_scope">
         <item>game.qualiarts.idolypride</item>
+        <item>game.qualiarts.idolypride_en</item>
     </string-array>
 </resources>

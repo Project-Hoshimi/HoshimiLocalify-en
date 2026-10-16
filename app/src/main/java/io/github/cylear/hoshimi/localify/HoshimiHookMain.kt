@@ -518,6 +518,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             val intent = Intent().apply {
                 setClassName("io.github.cylear.hoshimi.localify", "io.github.cylear.hoshimi.localify.TranslucentActivity")
                 putExtra("iprData", "requestConfig")
+                putExtra("gamePackage", activity.packageName)
                 flags = FLAG_ACTIVITY_NEW_TASK
             }
             activity.startActivity(intent)
