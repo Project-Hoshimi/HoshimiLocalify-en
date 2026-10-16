@@ -1612,6 +1612,123 @@ namespace HoshimiLocal::HookMain {
         }
     }
 
+    // Break `seg` (no '\n' inside) into `pieces` lines at the spaces closest to
+    // the even split points. Stops early if a piece has no space to break at.
+    static std::string SplitLineBalanced(const std::string& seg, size_t pieces) {
+        if (pieces < 2) return seg;
+        std::vector<size_t> starts; // byte offset of every UTF-8 char start
+        for (size_t k = 0; k < seg.size(); ++k)
+            if ((seg[k] & 0xC0) != 0x80) starts.push_back(k);
+        const size_t n = starts.size();
+        std::string out = seg;
+        size_t prev = 0; // char index after the previous break
+        for (size_t j = 1; j < pieces; ++j) {
+            size_t ideal = n * j / pieces;
+            size_t best = (size_t)-1, bestDist = (size_t)-1;
+            for (size_t c = prev + 1; c + 1 < n; ++c) {
+                if (seg[starts[c]] != ' ') continue;
+                size_t d = c > ideal ? c - ideal : ideal - c;
+                if (d < bestDist) { bestDist = d; best = c; }
+            }
+            if (best == (size_t)-1) break;
+            out[starts[best]] = '\n';
+            prev = best;
+        }
+        return out;
+    }
+
+    static size_t LongestLineChars(const std::string& text) {
+        size_t longest = 0, cur = 0;
+        for (char c : text) {
+            if (c == '\n') { if (cur > longest) longest = cur; cur = 0; }
+            else if ((c & 0xC0) != 0x80) ++cur;
+        }
+        return cur > longest ? cur : longest;
+    }
+
+    // Wide ADV caption over the video player. Font advance measured ~0.74em;
+    // 0.78 leaves margin. Split a single long line into 2 balanced lines and
+    // shrink the font so the longest one fits the rect width -> never more
+    // than 2 rows, so the speaker label / video controls stay clear.
+    static void FitStoryCaption(void* textComponent, float rectW, std::string& text) {
+        static auto get_fontSize = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "get_fontSize");
+        static auto set_fontSize = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_fontSize", {"System.Single"});
+        static auto set_enableAutoSizing = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_enableAutoSizing", {"System.Boolean"});
+        // We shrink fontSize ourselves, so remember the original (design) size.
+        static std::unordered_map<void*, float> captionDesign;
+        const float kAdvanceEm = 0.78f;
+        const float kMinSize = 30.0f;
+        float cur = get_fontSize ? get_fontSize->Invoke<float>(textComponent) : -1.0f;
+        float& design = captionDesign[textComponent];
+        if (cur > design) design = cur; // first sight, or pointer reused by a bigger label
+        if (design <= 0.0f) return;
+        const size_t perLine = (size_t)(rectW / (design * kAdvanceEm));
+        // Only split text that has no breaks yet: our own 2-line output comes
+        // back through set_text, and must be left byte-identical.
+        if (text.find('\n') == std::string::npos && Utf8CharCount(text) > perLine)
+            text = SplitLineBalanced(text, 2);
+        size_t longest = LongestLineChars(text);
+        float target = design;
+        if (longest > 0) {
+            float fit = rectW / ((float)longest * kAdvanceEm);
+            if (fit < target) target = fit;
+        }
+        if (target < kMinSize) target = kMinSize;
+        if (set_enableAutoSizing) set_enableAutoSizing->Invoke<void>(textComponent, false);
+        if (set_fontSize) set_fontSize->Invoke<void>(textComponent, target);
+        static int capLogged = 0;
+        if (capLogged < 300) {
+            Log::InfoFmt("[CaptionFit] design=%.1f rectW=%.1f perLine=%zu longest=%zu target=%.1f text=%.70s",
+                         design, rectW, perLine, longest, target, text.c_str());
+            ++capLogged;
+        }
+    }
+
+    // Story log bubble. Its rect is content-sized (0 on first bind, then varies
+    // with the text), so it is NOT used: fixed char budgets measured on device
+    // (~36 chars fit at full size, ~0.55em advance @ design 40).
+    static void FitStoryLogCell(void* textComponent, bool hadTag, std::string& text) {
+        const size_t kSplitAbove = 38; // segments longer than this get broken
+        const size_t kPerLine = 34;    // target chars per line when breaking
+        const float kFullFit = 36.0f;  // longest line that fits at 100%
+        if (!hadTag) {
+            std::string laid;
+            size_t segStart = 0;
+            for (size_t i = 0; i <= text.size(); ++i) {
+                if (i == text.size() || text[i] == '\n') {
+                    std::string seg = text.substr(segStart, i - segStart);
+                    size_t chars = Utf8CharCount(seg);
+                    if (chars > kSplitAbove)
+                        seg = SplitLineBalanced(seg, (chars + kPerLine - 1) / kPerLine);
+                    laid += seg;
+                    if (i < text.size()) laid += '\n';
+                    segStart = i + 1;
+                }
+            }
+            text.swap(laid);
+        }
+        size_t longest = LongestLineChars(text);
+        float scale = 1.0f;
+        if (longest > 0) {
+            scale = kFullFit / (float)longest;
+            if (scale > 1.0f) scale = 1.0f;
+            if (scale < 0.6f) scale = 0.6f;
+        }
+        static int logFitLogged = 0;
+        if (logFitLogged < 60) {
+            Log::InfoFmt("[LogFit] hadTag=%d longest=%zu scale=%.2f text=%.70s",
+                         hadTag ? 1 : 0, longest, scale, text.c_str());
+            ++logFitLogged;
+        }
+        if (scale < 1.0f) {
+            static auto set_richText = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_richText", {"System.Boolean"});
+            if (set_richText) set_richText->Invoke<void>(textComponent, true);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "<size=%d%%>", (int)(scale * 100.0f));
+            text = std::string(buf) + text + "</size>";
+        }
+    }
+
     void EnableStoryDialogText(void* textComponent, const std::string& origText, std::string& text) {
         if (!textComponent) return;
         static auto set_enableWordWrapping = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_enableWordWrapping", {"System.Boolean"});
@@ -1728,6 +1845,11 @@ namespace HoshimiLocal::HookMain {
             return;
         }
         if (isLogCell || isMsgLabel) {
+            if (isLogCell) { FitStoryLogCell(textComponent, hadTag, text); return; }
+            {
+                float captionW = GetTextRectWidth(textComponent);
+                if (captionW > 1000.0f) { FitStoryCaption(textComponent, captionW, text); return; }
+            }
             // Base single-line capacity at full size (char-split observed
             // ~17-19/line on the portrait dialogue boxes). Some story text
             // (e.g. the captions overlaying the landscape video player) renders
@@ -1807,35 +1929,6 @@ namespace HoshimiLocal::HookMain {
                 Log::InfoFmt("[StoryFit] path=%s design=%.1f rectW=%.1f cap=%.1f longest=%zu scale=%.2f text=%.70s",
                              path.c_str(), design, rectW, cap, longest, scale, text.c_str());
                 ++storyFitLogged;
-            }
-            if (isMsgLabel && rectW > 1000.0f) {
-                // The ADV Message Label is the game's built-in subtitle/caption
-                // system over the video player (wide landscape box, rectW>1000).
-                // Its own font-size logic shrinks long (English) lines well below
-                // the short Japanese originals, and it also uses TMP auto-sizing.
-                // Force a readable fixed size and disable auto-sizing so our
-                // word-wrapped layout governs. Narrow (portrait) dialogue boxes
-                // are left untouched so they can still auto-shrink to fit.
-                static auto get_enableAutoSizing = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "get_enableAutoSizing", {});
-                static auto get_fontSizeMin = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "get_fontSizeMin", {});
-                static auto get_fontSizeMax = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "get_fontSizeMax", {});
-                static auto set_enableAutoSizing = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_enableAutoSizing", {"System.Boolean"});
-                static auto set_fontSize = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_fontSize", {"System.Single"});
-                float autosize = -1.0f, fmin = -1.0f, fmax = -1.0f;
-                if (get_enableAutoSizing) autosize = get_enableAutoSizing->Invoke<bool>(textComponent) ? 1.0f : 0.0f;
-                if (get_fontSizeMin) fmin = get_fontSizeMin->Invoke<float>(textComponent);
-                if (get_fontSizeMax) fmax = get_fontSizeMax->Invoke<float>(textComponent);
-                const float subtitleFloor = 38.0f;
-                float target = design > subtitleFloor ? design : subtitleFloor;
-                if (set_enableAutoSizing) set_enableAutoSizing->Invoke<void>(textComponent, false);
-                if (set_fontSize) set_fontSize->Invoke<void>(textComponent, target);
-                static int subLogged = 0;
-                if (subLogged < 100) {
-                    Log::InfoFmt("[SubtitleFit] design=%.1f autosize=%.0f min=%.1f max=%.1f target=%.1f longest=%zu text=%.60s",
-                                 design, autosize, fmin, fmax, target, longest, text.c_str());
-                    ++subLogged;
-                }
-                return;
             }
             if (scale < 1.0f) {
                 static auto set_richText = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_richText", {"System.Boolean"});
