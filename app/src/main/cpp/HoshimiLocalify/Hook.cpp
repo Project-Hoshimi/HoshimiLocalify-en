@@ -1184,6 +1184,8 @@ namespace HoshimiLocal::HookMain {
         else if (path.find("SkillCardCutEffectView") != std::string::npos ||
                  path.find("LiveLogListCellEffectRow") != std::string::npos) kind = 3;
         else if (path.find("CardBasicInfo/Container/Info/Layout/Level/Layout/Lv") != std::string::npos) kind = 4;
+        else if (text == "Rank" && path.find("LeagueTab/") != std::string::npos &&
+                 path.find("ResultPanel/RankRoot/RankUnit") != std::string::npos) kind = 5;
         if (kind == 0) return;
 
         // Never re-enter while invoking TMP/RectTransform setters: setting font
@@ -1245,6 +1247,18 @@ namespace HoshimiLocal::HookMain {
                         set_anchoredPosition->Invoke<void>(levelTr, UnityResolve::UnityType::Vector2(cur.x, cur.y + 50.0f));
                         Log::InfoFmt("[CardLevel] moved level up 50 (was y=%.1f)", cur.y);
                     }
+                }
+            }
+        } else if (kind == 5) {
+            // VENUS League news result card: the rank unit box is sized for the JP
+            // "位" (32 wide), so "Rank" overflows it and the rank-change triangle,
+            // laid out right after the box, lands on top of the word. Widen the box
+            // so the triangle sits past it (re-applied if the game resets it).
+            if (get_transform && set_sizeDelta) {
+                ImageDebugVector2 sz{};
+                if (ReadRectTransformVec2(self, true, &sz) && sz.x > 0.0f && sz.x < 80.0f) {
+                    void* tr = get_transform->Invoke<void*>(self);
+                    if (tr) set_sizeDelta->Invoke<void>(tr, UnityResolve::UnityType::Vector2(80.0f, sz.y));
                 }
             }
         }
