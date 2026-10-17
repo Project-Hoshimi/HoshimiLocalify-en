@@ -1495,7 +1495,8 @@ namespace HoshimiLocal::HookMain {
             strcmp(klass->name, "SolisText") == 0;
         if (!isTmpLabel && !isStoryClass) return false;
         const std::string path = GetUnityComponentPath(textComponent);
-        if (isTmpLabel && path.find("component=Message Label]") != std::string::npos) {
+        if (isTmpLabel && (path.find("component=Message Label]") != std::string::npos ||
+                           path.find("component=Narration Label]") != std::string::npos)) {
             return true;
         }
         // Episode detail sheet (pre-story page): Title/Description come from
@@ -1852,7 +1853,9 @@ namespace HoshimiLocal::HookMain {
         const std::string path = GetUnityComponentPath(textComponent);
         bool isLogCell = path.find("component=Text]") != std::string::npos &&
             path.find("StoryLogListCell") != std::string::npos;
-        bool isMsgLabel = path.find("component=Message Label]") != std::string::npos;
+        // Narration Label (scene/setting captions) shares the Message Label layout.
+        bool isMsgLabel = path.find("component=Message Label]") != std::string::npos ||
+            path.find("component=Narration Label]") != std::string::npos;
         bool isDetailSheet = path.find("StoryFullScreenLoading/Root/Layout/") != std::string::npos &&
             (path.find("component=Title]") != std::string::npos ||
              path.find("component=Description]") != std::string::npos);
