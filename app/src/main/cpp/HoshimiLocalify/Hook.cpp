@@ -1300,6 +1300,64 @@ namespace HoshimiLocal::HookMain {
         busy = false;
     }
 
+    // The game strips '\n' from some strings before showing them on one line
+    // (story header title, character short profiles). Harmless for JP, but our
+    // multi-line EN translations come out glued ("ActuallyWant"). Map each
+    // translated value's newline-stripped form back to a space-joined form.
+    bool RestoreJoinedLineBreaks(const std::string& text, std::string* ret) {
+        if (!ret || text.size() < 8 || text.size() > 600 || text.find('\n') != std::string::npos) return false;
+        static std::unordered_map<std::string, std::string> joined;
+        static size_t builtFrom = 0;
+        static std::mutex joinedMutex;
+        std::lock_guard<std::mutex> guard(joinedMutex);
+        {
+            std::shared_lock<std::shared_mutex> lock(Local::localDataMutex);
+            if (builtFrom != Local::translatedText.size()) {
+                joined.clear();
+                for (const auto& v : Local::translatedText) {
+                    if (v.find('\n') == std::string::npos) continue;
+                    std::string stripped, spaced;
+                    for (char c : v) {
+                        if (c == '\r') continue;
+                        if (c == '\n') {
+                            if (!spaced.empty() && spaced.back() != ' ') spaced += ' ';
+                            continue;
+                        }
+                        if (c == ' ' && !spaced.empty() && spaced.back() == ' ') { stripped += c; continue; }
+                        stripped += c;
+                        spaced += c;
+                    }
+                    if (stripped == spaced || Local::translatedText.contains(stripped)) continue;
+                    joined.emplace(std::move(stripped), std::move(spaced));
+                }
+                builtFrom = Local::translatedText.size();
+            }
+        }
+        if (joined.empty()) return false;
+        // Peel leading/trailing rich-text tags (e.g. "<size=90%>...</size>").
+        size_t b = 0, e = text.size();
+        while (b < e && text[b] == '<') { auto c = text.find('>', b); if (c == std::string::npos || c >= e) break; b = c + 1; }
+        while (e > b && text[e - 1] == '>') { auto o = text.rfind('<', e - 1); if (o == std::string::npos || o < b) break; e = o; }
+        const std::string core = text.substr(b, e - b);
+        // Whole core, or a suffix after a space (e.g. "Ep. 1 " + title).
+        for (size_t pos = 0; pos < core.size();) {
+            auto it = joined.find(core.substr(pos));
+            if (it != joined.end()) {
+                *ret = text.substr(0, b) + core.substr(0, pos) + it->second + text.substr(e);
+                return true;
+            }
+            auto sp = core.find(' ', pos);
+            if (sp == std::string::npos) break;
+            pos = sp + 1;
+        }
+        return false;
+    }
+
+    bool GetGenericTextJoinFix(const std::string& origText, std::string* newStr, bool allowNewlineSplit = false) {
+        if (Local::GetGenericText(origText, newStr, allowNewlineSplit)) return true;
+        return RestoreJoinedLineBreaks(origText, newStr);
+    }
+
     void ProbeTextComponent(void* textComponent, const std::string& text) {
         TryApplyLiveHudGeometry(textComponent, text);
         FitOrientationSelectorLabel(textComponent, text);
@@ -1420,6 +1478,12 @@ namespace HoshimiLocal::HookMain {
             // labels (preAuto == false, e.g. the home footer nav) forcing auto-size
             // shrinks text the game intentionally renders at its design size (e.g.
             // "Nurture", whose JP-sized rect is narrower than the EN text).
+            // Story player header title is a fixed-size single line in JP; EN
+            // episode titles run off-screen, so let it shrink to fit too.
+            if (!preAuto) {
+                const std::string path = GetUnityComponentPath(textComponent);
+                preAuto = path.find("StoryPlayerScreen(Clone)/ScreenCanvas/ScreenRoot/Header/Title [component=Title]") != std::string::npos;
+            }
             if (preAuto) {
                 set_fontSizeMax->Invoke<void>(textComponent, designSize);
                 set_fontSizeMin->Invoke<void>(textComponent, designSize * 0.3f);
@@ -2075,7 +2139,7 @@ namespace HoshimiLocal::HookMain {
         const bool isStory = IsStoryDialogText(self, origText);
         const bool isTalkBubble = IsHomeTalkBubble(self);
         const bool isLoveBubble = IsLoveMessageBubble(self);
-        bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+        bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2124,7 +2188,7 @@ namespace HoshimiLocal::HookMain {
         const bool isStory = IsStoryDialogText(self, origText);
         const bool isTalkBubble = IsHomeTalkBubble(self);
         const bool isLoveBubble = IsLoveMessageBubble(self);
-        bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+        bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2172,7 +2236,7 @@ namespace HoshimiLocal::HookMain {
         const bool isStory = IsStoryDialogText(self, origText);
         const bool isTalkBubble = IsHomeTalkBubble(self);
         const bool isLoveBubble = IsLoveMessageBubble(self);
-        bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+        bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2220,7 +2284,7 @@ namespace HoshimiLocal::HookMain {
         const bool isStory = IsStoryDialogText(self, origText);
         const bool isTalkBubble = IsHomeTalkBubble(self);
         const bool isLoveBubble = IsLoveMessageBubble(self);
-        bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+        bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2270,7 +2334,7 @@ namespace HoshimiLocal::HookMain {
         if (currText) {
             //Log::InfoFmt("TextMeshProUGUI_Awake: %s", currText->ToString().c_str());
             std::string transText;
-            bool hasTrans = Local::GetGenericText(currText->ToString(), &transText);
+            bool hasTrans = GetGenericTextJoinFix(currText->ToString(), &transText);
             if (TryMakeVenusRewardButtonText(self, currText->ToString(), &transText)) hasTrans = true;
             std::string finalStr = MakeLocalizedText(currText->ToString(), transText, hasTrans);
 
@@ -2334,7 +2398,7 @@ namespace HoshimiLocal::HookMain {
         ProbeTextComponent(self, origText);
         std::string transText;
         const bool isStory = IsStoryDialogText(self, origText);
-        bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+        bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2391,7 +2455,7 @@ namespace HoshimiLocal::HookMain {
                     const bool isStory = IsStoryDialogText(self, origText);
                     const bool isTalkBubble = IsHomeTalkBubble(self);
                     const bool isLoveBubble = IsLoveMessageBubble(self);
-                    bool hasTrans = Local::GetGenericText(origText, &transText, !isStory);
+                    bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
                     if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
                     std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
@@ -2427,7 +2491,7 @@ namespace HoshimiLocal::HookMain {
         if (value) {
             ProbeTextComponent(self, value->ToString());
             std::string transText;
-            if (Local::GetGenericText(value->ToString(), &transText)) {
+            if (GetGenericTextJoinFix(value->ToString(), &transText)) {
                 transText = FixLigature(std::move(transText));
                 Local::DumpRemainingJapaneseText(transText);
                 return TextField_set_value_Orig(self, UnityResolve::UnityType::String::New(transText));
