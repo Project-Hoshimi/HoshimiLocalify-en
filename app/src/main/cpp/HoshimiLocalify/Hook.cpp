@@ -1441,6 +1441,44 @@ namespace HoshimiLocal::HookMain {
         return n;
     }
 
+    // Card detail header name ("<card title>　<idol name>"). EN titles are far
+    // longer than JP and wrap to three lines, running into the "Lv N /max"
+    // indicator above the name. Size this label by its visible length instead
+    // of the generic JP/EN ratio so it always stays within two lines.
+    bool IsCardNameLabel(void* textComponent) {
+        if (!textComponent) return false;
+        auto klass = Il2cppUtils::get_class_from_instance(textComponent);
+        if (!klass || !klass->name || strcmp(klass->name, "SolisText") != 0) return false;
+        return GetUnityComponentPath(textComponent).find("CardBasicInfo/Container/Info/Layout/Name [component=Name]") != std::string::npos;
+    }
+
+    bool TryFitCardNameText(void* textComponent, const std::string& origText, std::string* transText, bool& hasTrans) {
+        if (!textComponent || !transText) return false;
+        const std::string base = hasTrans ? *transText : origText;
+        if (base.find("<size=") != std::string::npos || base.find('\n') != std::string::npos) return false;
+        std::string visible;
+        bool inTag = false;
+        for (char c : base) {
+            if (c == '<') inTag = true;
+            else if (c == '>') inTag = false;
+            else if (!inTag) visible.push_back(c);
+        }
+        constexpr size_t kTwoLineChars = 40;
+        const size_t count = Utf8CharCount(visible);
+        if (count <= kTwoLineChars || !IsCardNameLabel(textComponent)) return false;
+        float scale = (float)kTwoLineChars / (float)count;
+        if (scale < 0.6f) scale = 0.6f;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "<size=%d%%>", (int)(scale * 100.0f));
+        *transText = std::string(buf) + base + "</size>";
+        hasTrans = true;
+        static std::unordered_set<std::string> logged;
+        if (logged.insert(base).second) {
+            Log::InfoFmt("[CardName] chars=%zu scale=%.2f text=%.80s", count, scale, base.c_str());
+        }
+        return true;
+    }
+
     void EnableTextAutoFit(void* textComponent, const std::string& origText, std::string& text) {
         if (!textComponent || textComponent == subtitleTextComponent) return;
         static auto set_enableAutoSizing = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "set_enableAutoSizing", {"System.Boolean"});
@@ -1489,6 +1527,8 @@ namespace HoshimiLocal::HookMain {
                 set_fontSizeMin->Invoke<void>(textComponent, designSize * 0.3f);
                 set_enableAutoSizing->Invoke<void>(textComponent, true);
             }
+        } else if (IsCardNameLabel(textComponent)) {
+            // Sized by TryFitCardNameText; don't stack another <size> on it.
         } else {
             float scale = 1.0f;
             if (!origText.empty() && !text.empty()) {
@@ -2141,6 +2181,7 @@ namespace HoshimiLocal::HookMain {
         const bool isLoveBubble = IsLoveMessageBubble(self);
         bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+        TryFitCardNameText(self, origText, &transText, hasTrans);
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
         if (hasTrans || finalStr != origText || HasTextLayoutMarker(finalStr) || isStory || isTalkBubble || isLoveBubble) {
@@ -2190,6 +2231,7 @@ namespace HoshimiLocal::HookMain {
         const bool isLoveBubble = IsLoveMessageBubble(self);
         bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+        TryFitCardNameText(self, origText, &transText, hasTrans);
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
         if (hasTrans || finalStr != origText || HasTextLayoutMarker(finalStr) || isStory || isTalkBubble || isLoveBubble) {
@@ -2238,6 +2280,7 @@ namespace HoshimiLocal::HookMain {
         const bool isLoveBubble = IsLoveMessageBubble(self);
         bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+        TryFitCardNameText(self, origText, &transText, hasTrans);
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
         if (hasTrans || finalStr != origText || HasTextLayoutMarker(finalStr) || isStory || isTalkBubble || isLoveBubble) {
@@ -2286,6 +2329,7 @@ namespace HoshimiLocal::HookMain {
         const bool isLoveBubble = IsLoveMessageBubble(self);
         bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+        TryFitCardNameText(self, origText, &transText, hasTrans);
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
 		if (hasTrans || finalStr != origText || HasTextLayoutMarker(finalStr) || isStory || isTalkBubble || isLoveBubble) {
@@ -2336,6 +2380,7 @@ namespace HoshimiLocal::HookMain {
             std::string transText;
             bool hasTrans = GetGenericTextJoinFix(currText->ToString(), &transText);
             if (TryMakeVenusRewardButtonText(self, currText->ToString(), &transText)) hasTrans = true;
+            TryFitCardNameText(self, currText->ToString(), &transText, hasTrans);
             std::string finalStr = MakeLocalizedText(currText->ToString(), transText, hasTrans);
 
             if (hasTrans || finalStr != currText->ToString() || HasTextLayoutMarker(finalStr)) {
@@ -2400,6 +2445,7 @@ namespace HoshimiLocal::HookMain {
         const bool isStory = IsStoryDialogText(self, origText);
         bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
         if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+        TryFitCardNameText(self, origText, &transText, hasTrans);
         std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
         if (hasTrans || finalStr != origText) {
@@ -2457,6 +2503,7 @@ namespace HoshimiLocal::HookMain {
                     const bool isLoveBubble = IsLoveMessageBubble(self);
                     bool hasTrans = GetGenericTextJoinFix(origText, &transText, !isStory);
                     if (TryMakeVenusRewardButtonText(self, origText, &transText)) hasTrans = true;
+                    TryFitCardNameText(self, origText, &transText, hasTrans);
                     std::string finalStr = MakeLocalizedText(origText, transText, hasTrans);
 
                     if (hasTrans || finalStr != origText || HasTextLayoutMarker(finalStr) || isStory || isTalkBubble || isLoveBubble) {
