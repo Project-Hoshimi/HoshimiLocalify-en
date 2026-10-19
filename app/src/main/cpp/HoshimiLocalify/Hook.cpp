@@ -1669,7 +1669,12 @@ namespace HoshimiLocal::HookMain {
         return true;
     }
 
+    // Set while FitLoveMessageBubble measures via GetPreferredValues, which
+    // re-enters PopulateTextBackingArray; hooks must pass straight through.
+    static thread_local bool loveMeasuring = false;
+
     void FitLoveMessageBubble(void* textComponent, std::string& text) {
+        if (loveMeasuring) return;
         // MoshiKoi (Love) ADV message bubble. The ADV script ships hard line
         // breaks tuned for JP (3 short lines) inside a fixed-size 9-slice bubble
         // that never wraps, so EN lines run off the right edge and overflow the
@@ -1714,15 +1719,55 @@ namespace HoshimiLocal::HookMain {
         float scale = 1.0f;
         size_t chars = Utf8CharCount(text);
         if (rectW > 0.0f && rectH > 0.0f && chars > 0) {
-            float charsPerLine = rectW / (design * 0.55f) * 0.9f;
-            if (charsPerLine < 1.0f) charsPerLine = 1.0f;
-            float estLines = (float)chars / charsPerLine;
-            float estLinesCeil = (float)((int)estLines + (estLines > (float)(int)estLines ? 1 : 0));
-            float maxLines = rectH / (design * 1.3f);
-            if (maxLines < 1.0f) maxLines = 1.0f;
-            scale = maxLines / estLinesCeil;
+            // Shrinking the font also widens each line, so the line count
+            // falls with the scale; measure the wrapped height with TMP itself
+            // and binary-search the largest <size> percent that fits the box.
+            struct LoveVec2 { float x; float y; };
+            static auto getPreferred = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "GetPreferredValues",
+                                                              {"System.String", "System.Single", "System.Single"});
+            const char* mode = "measure";
+            float fullH = 0.0f, fitH = 0.0f;
+            if (getPreferred) {
+                auto measure = [&](int pct) -> float {
+                    std::string probe = pct >= 100 ? text : ("<size=" + std::to_string(pct) + "%>" + text + "</size>");
+                    loveMeasuring = true;
+                    const float h = getPreferred->Invoke<LoveVec2>(textComponent, Il2cppString::New(probe), rectW, 100000.0f).y;
+                    loveMeasuring = false;
+                    return h;
+                };
+                fullH = measure(100);
+                int best = 100;
+                if (fullH > rectH) {
+                    int lo = 50, hi = 99;
+                    best = 50;
+                    while (lo <= hi) {
+                        int mid = (lo + hi) / 2;
+                        float h = measure(mid);
+                        if (h > 0.0f && h <= rectH) { best = mid; fitH = h; lo = mid + 1; }
+                        else hi = mid - 1;
+                    }
+                } else {
+                    fitH = fullH;
+                }
+                scale = best / 100.0f;
+            }
+            if (!getPreferred || fullH <= 0.0f) {
+                // Fallback estimate: lines(s) = ceil(estLines * s), each s*lineH tall.
+                mode = "estimate";
+                float charsPerLine = rectW / (design * 0.55f) * 0.9f;
+                if (charsPerLine < 1.0f) charsPerLine = 1.0f;
+                float estLines = (float)chars / charsPerLine;
+                float maxLines = rectH / (design * 1.3f);
+                if (maxLines < 1.0f) maxLines = 1.0f;
+                scale = 1.0f;
+                while (scale > 0.5f && std::ceil(estLines * scale) * scale > maxLines) scale -= 0.01f;
+            }
             if (scale > 1.0f) scale = 1.0f;
             if (scale < 0.5f) scale = 0.5f;
+            Log::InfoFmt("[LoveFit] mode=%s design=%.1f rectW=%.1f rectH=%.1f chars=%zu fullH=%.1f fitH=%.1f scale=%.2f text=%.60s",
+                         mode, design, rectW, rectH, chars, fullH, fitH, scale, text.c_str());
+        } else {
+            Log::InfoFmt("[LoveFit] skip design=%.1f rectW=%.1f rectH=%.1f chars=%zu", design, rectW, rectH, chars);
         }
         if (scale < 0.999f) {
             char buf[32];
@@ -2158,7 +2203,7 @@ namespace HoshimiLocal::HookMain {
     }
 
     DEFINE_HOOK(void, TMP_Text_PopulateTextBackingArray, (void* self, UnityResolve::UnityType::String* text, int start, int length)) {
-        if (!text) {
+        if (!text || loveMeasuring) {
             return TMP_Text_PopulateTextBackingArray_Orig(self, text, start, length);
         }
 
