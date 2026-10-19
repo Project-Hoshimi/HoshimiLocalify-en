@@ -3144,6 +3144,27 @@ namespace HoshimiLocal::HookMain {
         if (set_preserve_aspect) set_preserve_aspect->Invoke<void>(self, true);
     }
 
+    // Love ADV "Highlight!" banner: the English pieces (Hi/gh/li/gh/t/!) are narrower than the
+    // Japanese slots they replace, which leaves gaps. Slide each slot (letter + outline share a
+    // centre x) so the word is packed tightly. Only moves a slot still at its stock position.
+    void AdjustLoveChanceSlot(void* self, const std::string& name) {
+        int idx = 0;
+        if (sscanf(name.c_str(), "chance_line_%d", &idx) != 1 && sscanf(name.c_str(), "chance_%d", &idx) != 1) return;
+        if (idx < 1 || idx > 6) return;
+        static const float baseX[7] = {0.0f, -193.5f, -99.5f, -14.5f, 71.0f, 166.5f, 229.0f};
+        static const float targetX[7] = {0.0f, -164.7f, -70.7f, 2.3f, 78.8f, 174.3f, 200.2f};
+        ImageDebugVector2 cur{};
+        if (!ReadRectTransformVec2(self, false, &cur)) return;
+        if (std::fabs(cur.x - baseX[idx]) > 0.5f) return;
+        static auto get_transform = Il2cppUtils::GetMethod("UnityEngine.CoreModule.dll", "UnityEngine", "Component", "get_transform");
+        static auto set_anchoredPosition = Il2cppUtils::GetMethod("UnityEngine.CoreModule.dll", "UnityEngine", "RectTransform", "set_anchoredPosition", {"UnityEngine.Vector2"});
+        if (!get_transform || !set_anchoredPosition) return;
+        void* tr = get_transform->Invoke<void*>(self);
+        if (!tr) return;
+        set_anchoredPosition->Invoke<void>(tr, UnityResolve::UnityType::Vector2(targetX[idx], cur.y));
+        Log::InfoFmt("[LoveChance] %s x %.1f -> %.1f", name.c_str(), cur.x, targetX[idx]);
+    }
+
     bool LoadReplacementImageBytes(const std::string& name, std::vector<uint8_t>* bytes) {
         if (name.empty()) return false;
         return Local::GetResourceBytes(name + ".png", bytes) || Local::GetResourceBytes(name, bytes);
@@ -3203,6 +3224,7 @@ namespace HoshimiLocal::HookMain {
                 set_sprite->Invoke<void>(self, replacementSprite);
                 applying_image_replacement = false;
                 SetImagePreserveAspect(self);
+                AdjustLoveChanceSlot(self, name);
             }
         } else if (className == "RawImage") {
             static auto get_texture = Il2cppUtils::GetMethod("UnityEngine.UI.dll", "UnityEngine.UI", "RawImage", "get_texture");
@@ -3232,6 +3254,7 @@ namespace HoshimiLocal::HookMain {
                     LogSpriteReplacementDebug("Image.set_sprite", self, name, value, replacementSprite);
                     Image_set_sprite_Orig(self, replacementSprite, method);
                     SetImagePreserveAspect(self);
+                    AdjustLoveChanceSlot(self, name);
                     return;
                 }
             }
@@ -3251,6 +3274,7 @@ namespace HoshimiLocal::HookMain {
                     LogSpriteReplacementDebug("Image.set_overrideSprite", self, name, value, replacementSprite);
                     Image_set_overrideSprite_Orig(self, replacementSprite, method);
                     SetImagePreserveAspect(self);
+                    AdjustLoveChanceSlot(self, name);
                     return;
                 }
             }
