@@ -59,11 +59,26 @@ jobs:
 
       - name: Fetch EN translation data
         id: data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
         run: |
           set -euo pipefail
-          ver="$(curl -sS https://api.github.com/repos/tokanada/ipr-translation-data-en/releases/latest | jq -r .tag_name)"
+          ver="${PAYLOAD_TAG:-}"
+          if [ -z "$ver" ]; then
+            for i in 1 2 3 4 5; do
+              if ver="$(gh api repos/tokanada/ipr-translation-data-en/releases/latest --jq .tag_name 2>/tmp/latest.err)" \
+                 && [ -n "$ver" ] && [ "$ver" != "null" ]; then
+                break
+              fi
+              echo "Attempt $i: could not read latest data release tag: $(cat /tmp/latest.err 2>/dev/null)" >&2
+              ver=""
+              sleep 10
+            done
+          fi
           if [ -z "$ver" ] || [ "$ver" = "null" ]; then echo "Could not read latest data release tag" >&2; exit 1; fi
-          curl -fL -o /tmp/en.zip "https://github.com/tokanada/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
+          echo "Using data release $ver"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/en.zip "https://github.com/tokanada/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
           mkdir -p app/src/main/assets/hoshimi-local
           unzip -qo /tmp/en.zip -d app/src/main/assets/hoshimi-local
           echo "data_tag=$ver" >> "$GITHUB_OUTPUT"
