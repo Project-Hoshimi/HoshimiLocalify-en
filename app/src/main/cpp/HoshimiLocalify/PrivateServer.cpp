@@ -579,6 +579,31 @@ namespace HoshimiLocal::PrivateServer {
         return 0;
     }
 
+    // Rust's resolver (gRPC/YAHA) calls getaddrinfo(host, NULL) and stamps port 443 on the result
+    // itself, undoing ForceResolvedPort. Only the redirected game hosts resolve to g_baseAddress, so
+    // rewriting exactly <g_baseAddress>:443 -> <g_baseAddress>:<port> touches no other traffic.
+    using ConnectType = int (*)(int, const struct sockaddr*, socklen_t);
+    static ConnectType Connect_Orig = nullptr;
+    static std::atomic<int> g_connectLogCount{0};
+    static in_addr_t g_baseAddressNet = 0;
+
+    static int Connect_Hook(int fd, const struct sockaddr* addr, socklen_t len) {
+        if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in) && g_baseAddressNet != 0
+                && g_basePortNumber != 0 && g_basePortNumber != 443) {
+            const auto* in = reinterpret_cast<const struct sockaddr_in*>(addr);
+            if (in->sin_addr.s_addr == g_baseAddressNet && in->sin_port == htons(443)) {
+                struct sockaddr_in patched = *in;
+                patched.sin_port = htons(g_basePortNumber);
+                if (g_connectLogCount.fetch_add(1) < 10) {
+                    HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u", g_baseAddress.c_str(),
+                                               g_baseAddress.c_str(), g_basePortNumber);
+                }
+                return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&patched), sizeof(patched));
+            }
+        }
+        return Connect_Orig(fd, addr, len);
+    }
+
     PS_DEFINE_HOOK(Il2cppString*, Api_GetHost, (void* self, void* mtd)) {
         auto orig = Api_GetHost_Orig ? Api_GetHost_Orig(self, mtd) : nullptr;
         if (g_baseUrl.empty() || g_preserveHost) return orig;
@@ -705,11 +730,14 @@ namespace HoshimiLocal::PrivateServer {
                     HoshimiLocal::Log::InfoFmt("PrivateServer: hook %s installed", symName);
                 }
             };
-            // Only getaddrinfo is hooked: it is the resolver both libcurl and gRPC go through, and
-            // rewriting address plus port there makes a separate (and over-broad) connect() hook
-            // unnecessary. Non-game traffic never reaches this branch.
+            // getaddrinfo points the game hosts at g_baseAddress; connect() only fixes up the port for
+            // callers (Rust) that discard the resolved port. Non-game traffic never matches either.
+            in_addr parsed {};
+            if (inet_pton(AF_INET, g_baseAddress.c_str(), &parsed) == 1) g_baseAddressNet = parsed.s_addr;
             installSymbolHook("libc.so", "getaddrinfo", reinterpret_cast<void*>(&GetAddrInfo_Hook),
                               reinterpret_cast<void**>(&GetAddrInfo_Orig));
+            installSymbolHook("libc.so", "connect", reinterpret_cast<void*>(&Connect_Hook),
+                              reinterpret_cast<void**>(&Connect_Orig));
         }
         else {
             HoshimiLocal::Log::Info("PrivateServer: URL authority replaced, validation via CertificateHandler");
