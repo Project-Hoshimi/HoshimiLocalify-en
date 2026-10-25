@@ -95,7 +95,7 @@ fun MainUI(modifier: Modifier = Modifier, context: MainActivity? = null,
             Text(text = "${stringResource(R.string.current_resource_version)}: ${versionInfo[1]}", fontSize = 13.sp)
 
             SettingsTabs(modifier, listOf(stringResource(R.string.about), stringResource(R.string.home),
-                stringResource(R.string.advanced_settings)),
+                stringResource(R.string.advanced_settings), stringResource(R.string.private_server)),
                 context = context, previewData = previewData, screenH = screenH)
         }
 

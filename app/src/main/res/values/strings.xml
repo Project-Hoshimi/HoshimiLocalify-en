@@ -26,6 +26,12 @@
     <string name="useMasterDBTrans">Enable MasterDB Localization</string>
     <string name="export_text">Export Text</string>
     <string name="force_export_resource">Force Export Resource</string>
+    <string name="private_server">Private Server</string>
+    <string name="private_server_enabled">Enable private server</string>
+    <string name="private_server_url">Server URL</string>
+    <string name="private_server_url_hint">https://sumire.lan:8443</string>
+    <string name="private_server_ca_pem">Server CA (PEM)</string>
+    <string name="private_server_note">Redirects the game to a private server. Leave disabled for the official servers. The URL is scheme, host and port with no trailing slash; the CA must be the private server certificate authority in PEM form.</string>
     <string name="login_as_ios">Login as iOS</string>
     <string name="max_high">Ultra</string>
     <string name="very_high">Very High</string>
