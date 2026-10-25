@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
@@ -58,9 +59,8 @@ namespace HoshimiLocal::PrivateServer {
         std::string g_baseScheme;       // "https"
         std::string g_baseHost;         // lowercase host of g_baseUrl ("127.0.0.1")
         std::string g_basePort;         // port of g_baseUrl as text ("8443")
-        std::string g_baseAddress;      // IPv4 literal we redirect connections to ("" when unused)
+        std::string g_baseAddress;      // IPv4 literal getaddrinfo resolves game hosts to ("" when unused)
         unsigned short g_basePortNumber = 0;
-        in_addr_t g_baseAddrIpv4 = 0;
         // Set when we cannot hand Unity a CertificateHandler: the game's own hostnames are kept in
         // the request URL (so the server certificate's Common Name still matches) and the
         // connection is redirected to g_baseAddress instead.
@@ -150,12 +150,19 @@ namespace HoshimiLocal::PrivateServer {
 
     namespace {
         // Field offsets from the 6.0.2 arm64 dump (dump.cs:2042201 for UnityWebRequest,
-        // dump.cs:2041913 for CertificateHandler).
+        // dump.cs:2041913 for CertificateHandler). These are only fallbacks: Install() resolves
+        // the real offsets from il2cpp metadata and only keeps a constant when the lookup fails.
         constexpr std::size_t kUwrPtrOffset = 0x10;
         constexpr std::size_t kUwrCertificateHandlerOffset = 0x28;
         constexpr std::size_t kCertificateHandlerPtrOffset = 0x10;
         constexpr std::size_t kIl2CppArrayLengthOffset = 0x18;
         constexpr std::size_t kIl2CppArrayDataOffset = 0x20;
+
+        // Effective offsets, initialised in Install() before any hook is installed; read-only
+        // afterwards, so the worker-thread hooks can read them without locking.
+        std::size_t g_uwrPtrOffset = kUwrPtrOffset;
+        std::size_t g_uwrCertificateHandlerOffset = kUwrCertificateHandlerOffset;
+        std::size_t g_certificateHandlerPtrOffset = kCertificateHandlerPtrOffset;
 
         std::mutex g_handlerMutex;
         std::unordered_set<void*> g_ownCertificateHandlers;
@@ -197,17 +204,15 @@ namespace HoshimiLocal::PrivateServer {
             return false;
         }
 
+        // Handler mode only: replace the authority with the configured private server. In
+        // hostname-preserving mode the URL is left completely untouched (see GetAddrInfo_Hook),
+        // because rewriting the port there would also change the Host header for no benefit.
         std::string RewriteUrlForPrivateServer(const std::string& url) {
             std::string path;
             const std::string host = HostOfUrl(url, path);
             if (host.empty()) return url;
             if (!IsRedirectHost(host)) return url;
-            if (!g_preserveHost) return g_baseUrl + path;
-            // Hostname-preserving mode: keep the game's Host header and TLS SNI so the server
-            // certificate's Common Name still matches, and only swap in the private server port.
-            // The getaddrinfo/connect hooks send the connection to g_baseAddress.
-            if (url.compare(0, 6, "https:") != 0) return g_baseUrl + path;
-            return "https://" + host + ":" + g_basePort + path;
+            return g_baseUrl + path;
         }
 
         struct Il2CppArrayLayout {
@@ -248,6 +253,7 @@ namespace HoshimiLocal::PrivateServer {
         // surface is probed once and the caller falls back when it is incomplete.
         struct CertificateHandlerSurface {
             void* klassAddress = nullptr;
+            void* uwrKlassAddress = nullptr;
             void* ctor = nullptr;
             void* createIcall = nullptr;
             void* setter = nullptr;    // managed set_certificateHandler (MethodInfo*)
@@ -261,9 +267,12 @@ namespace HoshimiLocal::PrivateServer {
         };
 
         CertificateHandlerSurface g_handlerSurface;
-        void* g_sharedHandler = nullptr;      // one handler is enough, it is stateless
-        bool g_surfaceMissingLogged = false;
-        int g_attachLogCount = 0;
+        std::once_flag g_sharedHandlerOnce;
+        void* g_sharedHandler = nullptr;  // kept alive by the pinned GC handle below
+        std::uint32_t g_sharedHandlerGcHandle = 0;
+        std::atomic<bool> g_surfaceMissingLogged{false};
+        std::atomic<int> g_attachLogCount{0};
+        std::atomic<int> g_attachErrorCount{0};
 
         void ProbeCertificateHandlerSurface() {
             if (g_handlerSurface.checked) return;
@@ -280,6 +289,7 @@ namespace HoshimiLocal::PrivateServer {
             auto uwr = Il2cppUtils::GetClass("UnityEngine.UnityWebRequestModule.dll",
                                              "UnityEngine.Networking", "UnityWebRequest");
             if (uwr) {
+                g_handlerSurface.uwrKlassAddress = uwr->address;
                 g_handlerSurface.setter = Il2cppUtils::il2cpp_class_get_method_from_name(
                         uwr->address, "set_certificateHandler", 1);
             }
@@ -294,31 +304,84 @@ namespace HoshimiLocal::PrivateServer {
                                                : (g_handlerSurface.setIcall ? "icall" : "none"));
         }
 
+        std::size_t ResolveFieldOffset(void* klass, const char* fieldName, std::size_t fallback,
+                                       const char* label) {
+            if (klass) {
+                auto* field = UnityResolve::Invoke<Il2cppUtils::FieldInfo*>(
+                        "il2cpp_class_get_field_from_name", klass, fieldName);
+                if (field) {
+                    const int offset = UnityResolve::Invoke<int>("il2cpp_field_get_offset", field);
+                    // Instance fields live after the 16-byte object header; anything else means
+                    // the lookup hit a static field or the metadata call failed.
+                    if (offset >= static_cast<int>(2 * sizeof(void*)) && offset <= 0x400) {
+                        HoshimiLocal::Log::InfoFmt("PrivateServer: %s offset 0x%x (runtime)", label, offset);
+                        return static_cast<std::size_t>(offset);
+                    }
+                    HoshimiLocal::Log::ErrorFmt("PrivateServer: %s offset %d is unusable; using 0x%zx",
+                                                label, offset, fallback);
+                    return fallback;
+                }
+            }
+            HoshimiLocal::Log::InfoFmt("PrivateServer: %s not resolvable; using 0x%zx", label, fallback);
+            return fallback;
+        }
+
+        // Derived once in Install() before the hooks go in, so the worker-thread paths only read
+        // already-initialised values. The 6.0.2 dump offsets above stay as a safety net.
+        void ResolveFieldOffsets() {
+            if (g_handlerSurface.uwrKlassAddress) {
+                g_uwrPtrOffset = ResolveFieldOffset(g_handlerSurface.uwrKlassAddress, "m_Ptr",
+                                                    kUwrPtrOffset, "UnityWebRequest.m_Ptr");
+                g_uwrCertificateHandlerOffset = ResolveFieldOffset(
+                        g_handlerSurface.uwrKlassAddress, "m_CertificateHandler",
+                        kUwrCertificateHandlerOffset, "UnityWebRequest.m_CertificateHandler");
+            }
+            if (g_handlerSurface.klassAddress) {
+                g_certificateHandlerPtrOffset = ResolveFieldOffset(
+                        g_handlerSurface.klassAddress, "m_Ptr", kCertificateHandlerPtrOffset,
+                        "CertificateHandler.m_Ptr");
+            }
+        }
+
         void* CreateSharedCertificateHandler() {
-            if (g_sharedHandler) return g_sharedHandler;
-            if (!g_handlerSurface.Usable()) return nullptr;
-            void* obj = UnityResolve::Invoke<void*>("il2cpp_object_new", g_handlerSurface.klassAddress);
-            if (!obj) {
-                HoshimiLocal::Log::Error("PrivateServer: failed to allocate CertificateHandler");
-                return nullptr;
-            }
-            void* exception = nullptr;
-            UnityResolve::Invoke<void*>("il2cpp_runtime_invoke", g_handlerSurface.ctor, obj, nullptr, &exception);
-            if (exception) {
-                HoshimiLocal::Log::Error("PrivateServer: CertificateHandler .ctor threw");
-                return nullptr;
-            }
-            // The ctor is what binds the native object our callback belongs to; without it the
-            // managed instance is inert and attaching it would silently disable validation.
-            const auto nativePtr = *reinterpret_cast<void**>(
-                    reinterpret_cast<char*>(obj) + kCertificateHandlerPtrOffset);
-            if (!nativePtr) {
-                HoshimiLocal::Log::Error("PrivateServer: CertificateHandler has no native handle (Create icall missing)");
-                return nullptr;
-            }
-            g_sharedHandler = obj;
-            HoshimiLocal::Log::InfoFmt("PrivateServer: created CertificateHandler %p (native %p)", obj, nativePtr);
-            return obj;
+            std::call_once(g_sharedHandlerOnce, [] {
+                if (!g_handlerSurface.Usable()) return;
+                void* obj = UnityResolve::Invoke<void*>("il2cpp_object_new", g_handlerSurface.klassAddress);
+                if (!obj) {
+                    HoshimiLocal::Log::Error("PrivateServer: failed to allocate CertificateHandler");
+                    return;
+                }
+                void* exception = nullptr;
+                UnityResolve::Invoke<void*>("il2cpp_runtime_invoke", g_handlerSurface.ctor, obj, nullptr,
+                                            &exception);
+                if (exception) {
+                    HoshimiLocal::Log::Error("PrivateServer: CertificateHandler .ctor threw");
+                    return;
+                }
+                // The ctor is what binds the native object our callback belongs to; without it the
+                // managed instance is inert and attaching it would silently disable validation.
+                const auto nativePtr = *reinterpret_cast<void**>(
+                        reinterpret_cast<char*>(obj) + g_certificateHandlerPtrOffset);
+                if (!nativePtr) {
+                    HoshimiLocal::Log::Error("PrivateServer: CertificateHandler has no native handle "
+                                             "(Create icall missing)");
+                    return;
+                }
+                // Nothing else references the instance once AttachCertificateHandler returns, so it
+                // must be pinned for the process lifetime or the GC can collect/move it and leave
+                // every request with a dangling m_CertificateHandler.
+                const auto handle = UnityResolve::Invoke<std::uint32_t>("il2cpp_gchandle_new", obj, true);
+                if (handle == 0) {
+                    HoshimiLocal::Log::Error("PrivateServer: il2cpp_gchandle_new unavailable; refusing to "
+                                             "cache an unrooted CertificateHandler");
+                    return;
+                }
+                g_sharedHandlerGcHandle = handle;
+                g_sharedHandler = obj;
+                HoshimiLocal::Log::InfoFmt("PrivateServer: created CertificateHandler %p (native %p, gc handle 0x%x)",
+                                           obj, nativePtr, handle);
+            });
+            return g_sharedHandler;
         }
 
         // Registers the handler on the native request. Returns UnityWebRequestError (0 == ok),
@@ -335,9 +398,9 @@ namespace HoshimiLocal::PrivateServer {
             }
             if (g_handlerSurface.setIcall) {
                 const auto nativeSelf = *reinterpret_cast<void**>(
-                        reinterpret_cast<char*>(self) + kUwrPtrOffset);
+                        reinterpret_cast<char*>(self) + g_uwrPtrOffset);
                 const auto nativeHandler = *reinterpret_cast<void**>(
-                        reinterpret_cast<char*>(handler) + kCertificateHandlerPtrOffset);
+                        reinterpret_cast<char*>(handler) + g_certificateHandlerPtrOffset);
                 if (!nativeSelf || !nativeHandler) return -1;
                 using SetCertificateHandlerType = int (*)(void*, void*);
                 return reinterpret_cast<SetCertificateHandlerType>(g_handlerSurface.setIcall)(
@@ -346,15 +409,14 @@ namespace HoshimiLocal::PrivateServer {
             return -1;
         }
 
-        void EnsureCertificateHandler(void* self) {
-            auto* field = reinterpret_cast<void**>(reinterpret_cast<char*>(self) + kUwrCertificateHandlerOffset);
+        void EnsureCertificateHandler(void* self, const std::string& requestUrl) {
+            auto* field = reinterpret_cast<void**>(reinterpret_cast<char*>(self) + g_uwrCertificateHandlerOffset);
             if (*field) return;           // the game (or a previous call) already registered one
             if (g_caPem.empty()) return;  // without a CA we must not divert Unity's default validation
             if (!g_handlerSurface.Usable()) {
-                if (!g_surfaceMissingLogged) {
-                    g_surfaceMissingLogged = true;
-                    HoshimiLocal::Log::Error("PrivateServer: no usable CertificateHandler surface in this build; "
-                                             "not attaching a handler");
+                if (!g_surfaceMissingLogged.exchange(true)) {
+                    HoshimiLocal::Log::ErrorFmt("PrivateServer: no usable CertificateHandler surface in this build; "
+                                                "not attaching a handler (request %s)", requestUrl.c_str());
                 }
                 return;
             }
@@ -366,11 +428,19 @@ namespace HoshimiLocal::PrivateServer {
             }
             const int error = AttachCertificateHandler(self, handler);
             // Rate-limited: high traffic would otherwise flood logcat with one line per request.
-            if (g_attachLogCount < 5 || (g_attachLogCount % 50) == 0) {
-                HoshimiLocal::Log::InfoFmt("PrivateServer: attach CertificateHandler %p to %p -> error %d",
-                                           handler, self, error);
+            if (error != 0) {
+                const int count = g_attachErrorCount.fetch_add(1) + 1;
+                if (count <= 5 || (count % 50) == 0) {
+                    HoshimiLocal::Log::ErrorFmt("PrivateServer: attaching CertificateHandler to %s failed: error %d",
+                                                requestUrl.c_str(), error);
+                }
+                return;
             }
-            ++g_attachLogCount;
+            const int count = g_attachLogCount.fetch_add(1) + 1;
+            if (count <= 5 || (count % 50) == 0) {
+                HoshimiLocal::Log::InfoFmt("PrivateServer: attached CertificateHandler %p to %p for %s",
+                                           handler, self, requestUrl.c_str());
+            }
         }
 
         bool IsOwnCertificateHandler(void* self) {
@@ -402,18 +472,22 @@ namespace HoshimiLocal::PrivateServer {
         if (!orig) return nullptr;
         if (!self) return orig(self, mtd);
 
+        // In hostname-preserving mode the URL is deliberately left untouched (hostname and port):
+        // rewriting the port would change the Host header while adding no coverage, because the
+        // getaddrinfo hook already returns the private address and port for these hosts.
+        if (g_preserveHost) return orig(self, mtd);
+
+        std::string currentUrl;
         auto* url = CallGetUrl(self);
         if (url) {
             const std::string original = url->ToString();
-            const std::string rewritten = RewriteUrlForPrivateServer(original);
-            if (rewritten != original) {
-                CallSetUrl(self, Il2cppString::New(rewritten.c_str()));
-                HoshimiLocal::Log::InfoFmt("PrivateServer: %s -> %s", original.c_str(), rewritten.c_str());
+            currentUrl = RewriteUrlForPrivateServer(original);
+            if (currentUrl != original) {
+                CallSetUrl(self, Il2cppString::New(currentUrl.c_str()));
+                HoshimiLocal::Log::InfoFmt("PrivateServer: %s -> %s", original.c_str(), currentUrl.c_str());
             }
         }
-        // In hostname-preserving mode there is no handler surface to use; Unity validates against
-        // the system trust store plus the CA injected through Api.GetSSLRootCertificates.
-        if (!g_preserveHost) EnsureCertificateHandler(self);
+        EnsureCertificateHandler(self, currentUrl);
         return orig(self, mtd);
     }
 
@@ -440,11 +514,25 @@ namespace HoshimiLocal::PrivateServer {
 
     // ---- Hostname-preserving redirection ----
     // Used when no CertificateHandler can be attached: the URL keeps the game's hostname (so the
-    // certificate Common Name matches) and these hooks point the connection at the private server.
-    // getaddrinfo covers curl's resolver, connect() also catches pre-resolved addresses.
+    // certificate Common Name / TLS SNI still match) and this hook points the connection at the
+    // private server. The port is rewritten too: gRPC (YAHA, Rust hyper+rustls) asks for
+    // "<host>:443" while only 8443 is forwarded (`adb reverse tcp:8443 tcp:8443`), so every
+    // returned sockaddr is forced to g_basePortNumber regardless of the requested service.
     using GetAddrInfoType = int (*)(const char*, const char*, const struct addrinfo*, struct addrinfo**);
     static GetAddrInfoType GetAddrInfo_Orig = nullptr;
-    static int g_resolveLogCount = 0;
+    static std::atomic<int> g_resolveLogCount{0};
+
+    static void ForceResolvedPort(struct addrinfo* list) {
+        for (auto* ai = list; ai != nullptr; ai = ai->ai_next) {
+            if (!ai->ai_addr) continue;
+            if (ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) {
+                reinterpret_cast<struct sockaddr_in*>(ai->ai_addr)->sin_port = htons(g_basePortNumber);
+            }
+            else if (ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6)) {
+                reinterpret_cast<struct sockaddr_in6*>(ai->ai_addr)->sin6_port = htons(g_basePortNumber);
+            }
+        }
+    }
 
     static int GetAddrInfo_Hook(const char* node, const char* service, const struct addrinfo* hints,
                                 struct addrinfo** res) {
@@ -452,44 +540,43 @@ namespace HoshimiLocal::PrivateServer {
             errno = EADDRNOTAVAIL;
             return EAI_FAIL;
         }
-        if (g_baseAddress.empty() || !node || !*node || IsIpv4Literal(node)) {
+        // Everything outside an exact redirected game host - Firebase, Google, id.qseed.jp,
+        // CloudFront, literals - goes through the real resolver untouched.
+        if (!g_preserveHost || g_baseAddress.empty() || g_basePortNumber == 0 || !node || !*node
+                || IsIpv4Literal(node) || !IsRedirectHost(NormalizeHostName(node))) {
             return GetAddrInfo_Orig(node, service, hints, res);
         }
-        if (!IsRedirectHost(NormalizeHostName(node))) {
-            return GetAddrInfo_Orig(node, service, hints, res);
-        }
-        if (g_resolveLogCount < 10) {
-            HoshimiLocal::Log::InfoFmt("PrivateServer: resolve %s -> %s", node, g_baseAddress.c_str());
-            ++g_resolveLogCount;
-        }
-        return GetAddrInfo_Orig(g_baseAddress.c_str(), service, hints, res);
-    }
 
-    using ConnectType = int (*)(int, const struct sockaddr*, socklen_t);
-    static ConnectType Connect_Orig = nullptr;
-    static int g_connectLogCount = 0;
-
-    static int Connect_Hook(int fd, const struct sockaddr* addr, socklen_t len) {
-        if (!Connect_Orig) {
-            errno = EBADF;
-            return -1;
+        // The private server is reached over IPv4; if the caller pinned AF_INET6, relax the family
+        // instead of failing the connection.
+        struct addrinfo adjustedHints {};
+        const struct addrinfo* effectiveHints = hints;
+        if (hints && hints->ai_family == AF_INET6) {
+            adjustedHints = *hints;
+            adjustedHints.ai_family = AF_UNSPEC;
+            effectiveHints = &adjustedHints;
         }
-        if (!g_baseAddress.empty() && g_basePortNumber != 0 && g_baseAddrIpv4 != 0 && addr
-                && addr->sa_family == AF_INET
-                && len >= static_cast<socklen_t>(sizeof(struct sockaddr_in))) {
-            const auto* sin = reinterpret_cast<const struct sockaddr_in*>(addr);
-            if (ntohs(sin->sin_port) == g_basePortNumber && sin->sin_addr.s_addr != g_baseAddrIpv4) {
-                struct sockaddr_in local = *sin;
-                local.sin_addr.s_addr = g_baseAddrIpv4;
-                if (g_connectLogCount < 10) {
-                    HoshimiLocal::Log::InfoFmt("PrivateServer: connect fd %d redirected to %s:%u",
-                                               fd, g_baseAddress.c_str(), g_basePortNumber);
-                    ++g_connectLogCount;
-                }
-                return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&local), sizeof(local));
+
+        // Resolve with the private port so a null / "443" / "https" service cannot leave the
+        // socket aimed at <host>:443 where nothing is listening.
+        const int result = GetAddrInfo_Orig(g_baseAddress.c_str(), g_basePort.c_str(), effectiveHints, res);
+        if (result != 0) {
+            const int failures = g_resolveLogCount.fetch_add(1) + 1;
+            if (failures <= 10) {
+                HoshimiLocal::Log::ErrorFmt("PrivateServer: resolve %s:%s -> %s:%u failed: %d",
+                                            node, service ? service : "(null)", g_baseAddress.c_str(),
+                                            g_basePortNumber, result);
             }
+            return result;
         }
-        return Connect_Orig(fd, addr, len);
+        ForceResolvedPort(*res);
+        const int count = g_resolveLogCount.fetch_add(1) + 1;
+        if (count <= 10) {
+            HoshimiLocal::Log::InfoFmt("PrivateServer: resolve %s:%s -> %s:%u",
+                                       node, service ? service : "(null)", g_baseAddress.c_str(),
+                                       g_basePortNumber);
+        }
+        return 0;
     }
 
     PS_DEFINE_HOOK(Il2cppString*, Api_GetHost, (void* self, void* mtd)) {
@@ -568,8 +655,10 @@ namespace HoshimiLocal::PrivateServer {
         }
 
         g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com"};
-        if (!g_baseHost.empty() && std::find(g_redirectHosts.begin(), g_redirectHosts.end(), g_baseHost)
-                == g_redirectHosts.end()) {
+        // The configured authority only needs to be known as a redirect host in handler mode, when
+        // it is a hostname; an IPv4 endpoint is reached directly and would only clutter the list.
+        if (!g_baseHost.empty() && !IsIpv4Literal(g_baseHost)
+                && std::find(g_redirectHosts.begin(), g_redirectHosts.end(), g_baseHost) == g_redirectHosts.end()) {
             g_redirectHosts.push_back(g_baseHost);
         }
 
@@ -578,18 +667,34 @@ namespace HoshimiLocal::PrivateServer {
         //    CertificateHandler decides about the chain;
         //  * hostname-preserving mode - the build has no usable CertificateHandler surface, so the
         //    game's own hostnames are kept in the URL (the certificate Common Name keeps matching)
-        //    and the connection is redirected to the configured address instead.
+        //    and the getaddrinfo hook redirects the connection (address and port) instead.
         ProbeCertificateHandlerSurface();
+        ResolveFieldOffsets();
         const bool handlerMode = !g_caPem.empty() && g_handlerSurface.Usable();
         g_preserveHost = endpointOk && !handlerMode && g_baseScheme == "https" && IsIpv4Literal(g_baseHost);
         if (g_preserveHost) {
             g_baseAddress = g_baseHost;
-            struct in_addr parsedAddress {};
-            if (inet_pton(AF_INET, g_baseAddress.c_str(), &parsedAddress) == 1) {
-                g_baseAddrIpv4 = parsedAddress.s_addr;
-            }
-            HoshimiLocal::Log::InfoFmt("PrivateServer: preserving game hostnames; connections go to %s:%u",
-                                       g_baseAddress.c_str(), g_basePortNumber);
+        }
+
+        // Every hook below reads g_baseUrl / g_baseAddress / g_redirectHosts / g_preserveHost and the
+        // field offsets, so they are all final before the first hook is installed.
+        std::string hostList;
+        for (const auto& host : g_redirectHosts) {
+            if (!hostList.empty()) hostList += ", ";
+            hostList += host;
+        }
+        const char* mode = g_preserveHost ? "preserve-host"
+                : (handlerMode ? "certificate-handler" : "url-rewrite-no-handler");
+        HoshimiLocal::Log::InfoFmt("PrivateServer: mode=%s redirect=%s:%s hosts=[%s] caPem=%zu bytes",
+                                   mode,
+                                   g_preserveHost ? g_baseAddress.c_str() : g_baseHost.c_str(),
+                                   g_basePort.c_str(), hostList.c_str(), g_caPem.size());
+        if (!g_preserveHost && !handlerMode) {
+            HoshimiLocal::Log::Error("PrivateServer: no usable CertificateHandler and the endpoint is not an "
+                                     "IPv4 literal; TLS will fall back to the system trust store");
+        }
+
+        if (g_preserveHost) {
             auto installSymbolHook = [](const char* libName, const char* symName, void* hook, void** orig) {
                 if (shadowhook_hook_sym_name(libName, symName, hook, orig) == nullptr) {
                     const int errorNum = shadowhook_get_errno();
@@ -600,10 +705,11 @@ namespace HoshimiLocal::PrivateServer {
                     HoshimiLocal::Log::InfoFmt("PrivateServer: hook %s installed", symName);
                 }
             };
+            // Only getaddrinfo is hooked: it is the resolver both libcurl and gRPC go through, and
+            // rewriting address plus port there makes a separate (and over-broad) connect() hook
+            // unnecessary. Non-game traffic never reaches this branch.
             installSymbolHook("libc.so", "getaddrinfo", reinterpret_cast<void*>(&GetAddrInfo_Hook),
                               reinterpret_cast<void**>(&GetAddrInfo_Orig));
-            installSymbolHook("libc.so", "connect", reinterpret_cast<void*>(&Connect_Hook),
-                              reinterpret_cast<void**>(&Connect_Orig));
         }
         else {
             HoshimiLocal::Log::Info("PrivateServer: URL authority replaced, validation via CertificateHandler");
