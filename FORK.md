@@ -75,4 +75,38 @@ When enabled, the mod:
 4. (Phase 2, rootless) rewrites `UnityWebRequest` URLs for the game/Octo hosts and validates
    the server certificate against the configured CA.
 
-The Frida path (`sumire-sr/frida/e2e_hooks.js`) remains the supported fallback.
+## Private-server setup for players
+
+1. Install this fork's APK (same package as the `-en` build, so uninstall or upgrade it,
+   not both).
+2. Enable the module for `game.qualiarts.idolypride` in LSPosed.
+3. Open the mod app, go to the **Private server** tab.
+4. **Server URL**: scheme, host and port with no trailing slash, e.g.
+   `https://sumire.lan:8443`. The host must be one of the DNS names or IPs in the
+   server certificate (the SANs in `sumire-sr/tls/api.ext`).
+5. **Server CA PEM**: paste the whole contents of `sumire-sr/tls/ca.crt`, including the
+   `BEGIN`/`END` lines. One or more certificates are accepted.
+6. Turn the switch on, force-stop the game, and launch it **from the mod app** so the
+   config reaches the game process. Launching from the home screen still works through
+   the fallback config request in most cases.
+7. Server side: run sumire-sr with `TLS=1 HTTP2=1 PORT=8443
+   PUBLIC_BASE_URL=https://sumire.lan:8443`, or master downloads will point at the
+   official host.
+
+Leave the switch off for the official servers: with it off no hooks are installed and the
+game behaves exactly like the `-en` build. Only point the mod at a server you control —
+the CA you paste is trusted for every request the redirected hosts make.
+
+The Frida redirect in `sumire-sr/frida/` is the fallback path for rooted devices without
+the mod; it is documented in `sumire-sr/docs/CLIENT_SETUP.md`.
+
+## Status
+
+| Piece | State |
+|---|---|
+| Config fields, settings page (EN/KO) | done, builds |
+| `Api.GetHost` / `Api.GetSSLRootCertificates` / `OctoSettings.url` hooks | done, builds |
+| `UnityWebRequest` URL rewrite + `CertificateHandler` pin | done, builds, not yet verified on a device |
+| sumire-sr `PUBLIC_BASE_URL` | done, `npm run typecheck` clean |
+| on-device E2E, LSPatch | blocked: no test device here |
+
