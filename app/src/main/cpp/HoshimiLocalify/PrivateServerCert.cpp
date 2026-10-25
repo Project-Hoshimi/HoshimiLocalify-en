@@ -136,7 +136,7 @@ bool VerifyChainAgainstPem(const unsigned char* leafDer, std::size_t leafDerLen,
         if (caCert==nullptr) goto cleanup;
         if (!env->IsInstanceOf(caCert,x509Class)) { env->DeleteLocalRef(caCert); HoshimiLocal::Log::ErrorFmt("PrivateServerCert: CA is not an X509Certificate"); goto cleanup; }
         jobject caSubject=env->CallObjectMethod(caCert,getSubject);
-        if (caSubject==nullptr || CheckException(env,true)) { env->DeleteLocalRef(caCert); HoshimiLocal::Log::ErrorFmt("PrivateServerCert: failed to get CA subject"); goto cleanup; }
+        if (caSubject==nullptr || CheckException(env,true)) { if (caSubject) env->DeleteLocalRef(caSubject); env->DeleteLocalRef(caCert); HoshimiLocal::Log::ErrorFmt("PrivateServerCert: failed to get CA subject"); goto cleanup; }
         const jboolean issuerMatches=env->CallBooleanMethod(leafIssuer,equals,caSubject);
         if (CheckException(env,true)) { env->DeleteLocalRef(caSubject); env->DeleteLocalRef(caCert); HoshimiLocal::Log::ErrorFmt("PrivateServerCert: issuer comparison failed"); goto cleanup; }
         if (issuerMatches!=JNI_TRUE) { env->DeleteLocalRef(caSubject); env->DeleteLocalRef(caCert); continue; }
