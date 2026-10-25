@@ -33,6 +33,10 @@ data class IdolyprideConfig (
 
     var loginAsIOS: Boolean = false,
 
+    var privateServerEnabled: Boolean = false,
+    var privateServerUrl: String = "",
+    var privateServerCaPem: String = "",
+
     var useCustomeGraphicSettings: Boolean = false,
     var renderScale: Float = 0.77f,
     var qualitySettingsLevel: Int = 3,
