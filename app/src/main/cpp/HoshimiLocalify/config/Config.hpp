@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace HoshimiLocal::Config {
     extern bool isConfigInit;
 
@@ -32,6 +34,10 @@ namespace HoshimiLocal::Config {
     extern std::string liveCustomeCostumeId;
 
     extern bool loginAsIOS;
+
+    extern bool privateServerEnabled;
+    extern std::string privateServerUrl;
+    extern std::string privateServerCaPem;
 
     extern bool useCustomeGraphicSettings;
     extern float renderScale;
