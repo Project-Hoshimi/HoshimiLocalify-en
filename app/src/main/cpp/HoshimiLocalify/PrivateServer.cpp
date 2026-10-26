@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -664,9 +665,15 @@ namespace HoshimiLocal::PrivateServer {
     static ConnectType Connect_Orig = nullptr;
     static in_addr_t g_baseAddressNet = 0;
 
+    // Java sockets on Android are dual-stack AF_INET6 sockets, so libcore hands bionic an
+    // IPv4-mapped IPv6 sockaddr (::ffff:<server>, 443) even though the address is IPv4. Both
+    // families must be handled or Java traffic keeps connecting to 443 (the native game socket that
+    // *was* rewritten used a plain AF_INET sockaddr).
     static int Connect_Hook(int fd, const struct sockaddr* addr, socklen_t len) {
-        if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in) && g_baseAddressNet != 0
-                && g_basePortNumber != 0 && g_basePortNumber != 443) {
+        if (!addr || g_baseAddressNet == 0 || g_basePortNumber == 0 || g_basePortNumber == 443) {
+            return Connect_Orig(fd, addr, len);
+        }
+        if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
             const auto* in = reinterpret_cast<const struct sockaddr_in*>(addr);
             if (in->sin_addr.s_addr == g_baseAddressNet && in->sin_port == htons(443)) {
                 struct sockaddr_in patched = *in;
@@ -675,6 +682,23 @@ namespace HoshimiLocal::PrivateServer {
                 HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u", g_baseAddress.c_str(),
                                            g_baseAddress.c_str(), g_basePortNumber);
                 return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&patched), sizeof(patched));
+            }
+        }
+        else if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+            const auto* in6 = reinterpret_cast<const struct sockaddr_in6*>(addr);
+            if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr) && in6->sin6_port == htons(443)) {
+                struct in_addr mapped {};
+                std::memcpy(&mapped.s_addr, in6->sin6_addr.s6_addr + 12, sizeof(mapped.s_addr));
+                if (mapped.s_addr == g_baseAddressNet) {
+                    // Keep the sockaddr family/scope: only the port changes, so the kernel still
+                    // sees the dual-stack socket the caller expected.
+                    struct sockaddr_in6 patched = *in6;
+                    patched.sin6_port = htons(g_basePortNumber);
+                    HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u (v4-mapped inet6)",
+                                               g_baseAddress.c_str(), g_baseAddress.c_str(),
+                                               g_basePortNumber);
+                    return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&patched), sizeof(patched));
+                }
             }
         }
         return Connect_Orig(fd, addr, len);
