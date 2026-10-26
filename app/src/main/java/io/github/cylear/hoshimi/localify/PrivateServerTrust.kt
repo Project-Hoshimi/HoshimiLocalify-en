@@ -3,6 +3,7 @@ package io.github.cylear.hoshimi.localify
 import android.app.Activity
 import android.app.AndroidAppHelper
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -36,15 +37,38 @@ import javax.net.ssl.X509TrustManager
  * private server is accepted without the CA being present in the Android system store (which we
  * cannot write to on an unrooted, LSPatch-patched device).
  *
- * We only *append* certificates to the array returned by getAcceptedIssuers(). That array does not
- * take part in the validation decisions of conscrypt, so java.net / OkHttp / every other consumer
- * keeps validating exactly as before; nothing is accepted that was not accepted before, and there
- * is no accept-all path here.
+ * Scope of the change:
+ *  - We only *append* certificates to the array returned by getAcceptedIssuers(), and only the CA
+ *    configured for the private server is appended. Nothing else is added.
+ *  - That augmented array is visible process-wide inside the game process: every consumer of the
+ *    TrustManagerFactory in that process sees it, because the same X509TrustManager instance is
+ *    shared. In practice that is libunity.so (UnityTLS/UnityWebRequest reads it over JNI).
+ *  - Java-side validation is unaffected: getAcceptedIssuers() is only the list of *candidate*
+ *    issuers; the actual chain check still goes through checkServerTrusted(), which we do not touch.
+ *    No host is accepted that was not accepted before, and there is no accept-all path here.
+ *
+ * Trust state is driven exclusively by the configuration delivered to the *game* process (launch
+ * intent, the `requestConfig` response, or a later intent). The module app never writes into the
+ * game's filesDir, so the cache read on a direct launch is only ever a fallback for the window
+ * before the config arrives; it is honoured only when it carries an "enabled" marker, and it is
+ * dropped as soon as a disabled/blank configuration is observed.
  */
 object PrivateServerTrust {
     private const val CACHE_FILE_NAME = "hoshimi-private-server-ca.pem"
+    private const val CACHE_FORMAT_HEADER = "# hoshimi-private-server-ca-cache v1"
+    private const val CACHE_ENABLED_PREFIX = "# enabled="
+    private const val CACHE_SAVED_AT_PREFIX = "# savedAt="
     private const val REQUEST_CONFIG_MARKER = "requestConfig"
     private const val AUGMENT_LOG_INTERVAL_MS = 2000L
+
+    /**
+     * A cache entry is only ever a hint for the next direct launch. If no configuration has
+     * corroborated it for this long, the module app is gone (or never launched) and the private
+     * server cannot be configured at all, so the entry is discarded instead of being trusted
+     * forever.
+     */
+    private const val CACHE_MAX_AGE_MS = 30L * 24 * 60 * 60 * 1000
+    private const val CACHE_REFRESH_INTERVAL_MS = 60L * 60 * 1000
 
     /** Lenient on purpose: a config written by a newer/older module build must never break trust. */
     private val configJson = Json { ignoreUnknownKeys = true }
@@ -55,6 +79,9 @@ object PrivateServerTrust {
     private val installed = AtomicBoolean(false)
     private val hookedAcceptedIssuersMethods = ConcurrentHashMap.newKeySet<Method>()
     private val classesWithoutAcceptedIssuers = ConcurrentHashMap.newKeySet<Class<*>>()
+
+    /** Last time the getTrustManagers log line was emitted, per observed trust manager class set. */
+    private val trustManagerLogStates = ConcurrentHashMap<String, Long>()
 
     @Volatile
     private var caCerts: List<X509Certificate> = emptyList()
@@ -82,25 +109,36 @@ object PrivateServerTrust {
         if (activity == null) {
             return
         }
+        val source = "intent/${activity.javaClass.simpleName}"
+        observeIntent(activity.intent, source)
+    }
+
+    /**
+     * Feeds an intent that is delivered after the activity already exists (the `requestConfig`
+     * answer arrives through `onNewIntent` on a task-reused Unity activity, where `getIntent()`
+     * still returns the stale launch intent).
+     */
+    fun observeIntent(intent: Intent?, source: String) {
         val raw = try {
-            activity.intent?.getStringExtra("iprData")
+            intent?.getStringExtra("iprData")
         }
         catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerTrust: cannot read the launch intent", t)
+            Log.w(TAG, "PrivateServerTrust: cannot read the intent from $source", t)
             null
         }
         if (raw.isNullOrBlank()) {
-            // Launched straight from the launcher: fall back to the CA cached by a previous start.
-            ensureCachedCaLoaded()
+            // Launched straight from the launcher: fall back to the CA cached by a previous start,
+            // but only while the cache still proves that the private server was enabled.
+            ensureCachedCaLoaded(source)
             return
         }
-        observeConfigJson(raw, "intent/${activity.javaClass.simpleName}")
+        observeConfigJson(raw, source)
     }
 
     /** Feeds an already received `iprData` JSON payload or parsed configuration. */
     fun observeConfigJson(raw: String?, source: String) {
         if (raw.isNullOrBlank() || raw == REQUEST_CONFIG_MARKER) {
-            ensureCachedCaLoaded()
+            ensureCachedCaLoaded(source)
             return
         }
         val config = try {
@@ -134,26 +172,18 @@ object PrivateServerTrust {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     try {
                         // Oldest hook point that can still see a cached CA on a direct launch.
-                        ensureCachedCaLoaded()
+                        ensureCachedCaLoaded("getTrustManagers")
 
-                        val managers = param.result as? Array<*> ?: return
+                        val managers = (param.result as? Array<*>)
+                            ?.filterIsInstance<X509TrustManager>()
+                            ?: return
                         var hooked = 0
-                        var trustManagers = 0
                         for (manager in managers) {
-                            if (manager !is X509TrustManager) {
-                                continue
-                            }
-                            trustManagers++
                             if (hookAcceptedIssuers(manager.javaClass)) {
                                 hooked++
                             }
                         }
-                        Log.i(
-                            TAG,
-                            "PrivateServerTrust: TrustManagerFactory.getTrustManagers -> " +
-                                    "$trustManagers X509TrustManager(s), newly hooked $hooked, " +
-                                    "caCerts=${caCerts.size}"
-                        )
+                        logTrustManagers(managers, hooked)
                     }
                     catch (t: Throwable) {
                         Log.w(TAG, "PrivateServerTrust: getTrustManagers hook failed", t)
@@ -168,9 +198,39 @@ object PrivateServerTrust {
     }
 
     /**
+     * getTrustManagers runs for every keystore/algorithm pair and is called often enough to spam
+     * the log. The first call for a given set of trust manager classes is always logged; repeats
+     * are throttled exactly like the augmentation log.
+     */
+    private fun logTrustManagers(managers: List<X509TrustManager>, hooked: Int) {
+        val key = managers.map { it.javaClass.name }.distinct().sorted().joinToString(",")
+            .ifEmpty { "<none>" }
+        val now = SystemClock.elapsedRealtime()
+        val firstForClasses = trustManagerLogStates.putIfAbsent(key, now) == null
+        if (!firstForClasses) {
+            val last = trustManagerLogStates[key] ?: now
+            if (now - last < AUGMENT_LOG_INTERVAL_MS) {
+                return
+            }
+            trustManagerLogStates[key] = now
+        }
+        Log.i(
+            TAG,
+            "PrivateServerTrust: TrustManagerFactory.getTrustManagers -> " +
+                    "${managers.size} X509TrustManager(s) [$key], newly hooked $hooked, " +
+                    "caCerts=${caCerts.size}"
+        )
+    }
+
+    /**
      * The configuration reaches the game process as an Intent extra, so the earliest point where
      * the PEM is readable is right before the Unity activity is created (callActivityOnCreate runs
      * before onCreate, and therefore before UnityPlayer starts the runtime and its networking).
+     *
+     * `onNewIntent` covers the `requestConfig` answer: the module app starts the already running
+     * Unity activity to hand over the current configuration, and that intent never becomes
+     * `Activity.getIntent()`, so without this hook the fresh (possibly disabled) config would only
+     * be seen if the activity were recreated.
      */
     private fun hookActivityLaunch(classLoader: ClassLoader) {
         try {
@@ -195,6 +255,33 @@ object PrivateServerTrust {
         }
         catch (t: Throwable) {
             Log.w(TAG, "PrivateServerTrust: cannot hook Instrumentation.callActivityOnCreate", t)
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Activity",
+                classLoader,
+                "onNewIntent",
+                Intent::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val activity = param.thisObject as? Activity
+                            observeIntent(
+                                param.args[0] as? Intent,
+                                "onNewIntent/${activity?.javaClass?.simpleName ?: "unknown"}"
+                            )
+                        }
+                        catch (t: Throwable) {
+                            Log.w(TAG, "PrivateServerTrust: onNewIntent pickup failed", t)
+                        }
+                    }
+                }
+            )
+            Log.i(TAG, "PrivateServerTrust: hooked Activity.onNewIntent for config updates")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot hook Activity.onNewIntent", t)
         }
     }
 
@@ -286,13 +373,28 @@ object PrivateServerTrust {
 
     // ---- configuration -------------------------------------------------------------------
 
-    private fun applyConfig(enabled: Boolean, pem: String, source: String, context: Context?) {
+    private fun applyConfig(
+        enabled: Boolean,
+        pem: String,
+        source: String,
+        context: Context?,
+        updateCache: Boolean = true
+    ) {
         if (!enabled || pem.isBlank()) {
-            if (caCerts.isNotEmpty()) {
-                caCerts = emptyList()
-                Log.i(TAG, "PrivateServerTrust: private server CA removed ($source)")
+            // A disabled or blank config is authoritative: drop the in-memory anchors and the cache
+            // immediately, so neither this process nor the next direct launch keeps trusting a CA
+            // the user has turned off.
+            val hadCerts = caCerts.isNotEmpty()
+            caCerts = emptyList()
+            val removed = deleteCachedCa(context)
+            if (hadCerts || removed) {
+                Log.i(
+                    TAG,
+                    "PrivateServerTrust: private server disabled/blank ($source); " +
+                            "caCerts cleared (had=$hadCerts), cached CA " +
+                            (if (removed) "deleted" else "absent")
+                )
             }
-            deleteCachedCa(context)
             return
         }
 
@@ -302,6 +404,9 @@ object PrivateServerTrust {
             return
         }
         if (sameCerts(parsed, caCerts)) {
+            if (updateCache) {
+                writeCachedCa(context, pem)
+            }
             return
         }
 
@@ -311,7 +416,9 @@ object PrivateServerTrust {
             "PrivateServerTrust: private server CA loaded from $source: count=${parsed.size}, " +
                     "subjects=[${parsed.joinToString { it.subjectX500Principal.name }}]"
         )
-        writeCachedCa(context, pem)
+        if (updateCache) {
+            writeCachedCa(context, pem)
+        }
     }
 
     private fun parseCerts(pem: String): List<X509Certificate> {
@@ -353,12 +460,21 @@ object PrivateServerTrust {
 
     // ---- cache ---------------------------------------------------------------------------
 
+    private data class CachedCa(val pem: String, val enabled: Boolean, val savedAt: Long)
+
     /**
-     * Launching the game straight from the launcher carries no `iprData` extra, so the CA seen on a
-     * previous (module initiated) launch is cached in the game's own files directory. Only the game
-     * process can read or write it, which is exactly what LSPatch integrated mode needs.
+     * Launching the game straight from the launcher carries no `iprData` extra. The CA seen on a
+     * previous (module initiated) launch is cached in the game's own files directory, which only
+     * the game process can read or write — that is exactly what LSPatch integrated mode needs, and
+     * the module app deliberately never touches it.
+     *
+     * The cache is *not* self-authorising: it only says "the last configuration this process
+     * received had the private server enabled". It is therefore honoured only when it carries that
+     * marker, it is discarded once it is older than [CACHE_MAX_AGE_MS], and [applyConfig] removes
+     * it the moment a disabled or blank configuration arrives (normally within the first frame
+     * after the `requestConfig` answer, see the onNewIntent hook).
      */
-    private fun ensureCachedCaLoaded() {
+    private fun ensureCachedCaLoaded(source: String) {
         if (cacheFileRead) {
             return
         }
@@ -372,45 +488,140 @@ object PrivateServerTrust {
             return
         }
         val file = File(context.filesDir, CACHE_FILE_NAME)
-        val pem = try {
-            if (file.isFile) file.readText() else null
+        val cached = readCachedCa(file, source) ?: return
+        if (!cached.enabled) {
+            Log.i(
+                TAG,
+                "PrivateServerTrust: cached CA at ${file.absolutePath} is not marked enabled; " +
+                        "not trusted ($source)"
+            )
+            deleteCachedCa(file)
+            return
+        }
+        val now = System.currentTimeMillis()
+        val age = if (cached.savedAt > 0L) now - cached.savedAt else -1L
+        if (age > CACHE_MAX_AGE_MS) {
+            Log.i(
+                TAG,
+                "PrivateServerTrust: cached CA at ${file.absolutePath} is stale " +
+                        "(age=${age / 86_400_000L}d, limit=${CACHE_MAX_AGE_MS / 86_400_000L}d); " +
+                        "not trusted ($source)"
+            )
+            deleteCachedCa(file)
+            return
+        }
+        Log.i(
+            TAG,
+            "PrivateServerTrust: direct launch without config; using the enabled-marked CA " +
+                    "cached at ${file.absolutePath} (age=${if (age >= 0L) "${age / 3_600_000L}h" else "unknown"}; " +
+                    "will be revoked when a disabled config arrives)"
+        )
+        applyConfig(true, cached.pem, "cache/$source", context, updateCache = false)
+    }
+
+    private fun readCachedCa(file: File, source: String): CachedCa? {
+        if (!file.isFile) {
+            return null
+        }
+        val text = try {
+            file.readText()
         }
         catch (t: Throwable) {
             Log.w(TAG, "PrivateServerTrust: cannot read the cached CA", t)
-            null
+            return null
         }
-        if (pem.isNullOrBlank()) {
-            return
+        if (text.isBlank()) {
+            return null
         }
-        Log.i(TAG, "PrivateServerTrust: using the CA cached at ${file.absolutePath}")
-        applyConfig(true, pem, "cache", context)
+        var enabled = false
+        var savedAt = 0L
+        var marked = false
+        val pemLines = ArrayList<String>()
+        for (line in text.lineSequence()) {
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith(CACHE_ENABLED_PREFIX) -> {
+                    enabled = trimmed.removePrefix(CACHE_ENABLED_PREFIX).trim()
+                        .equals("true", ignoreCase = true)
+                    marked = true
+                }
+                trimmed.startsWith(CACHE_SAVED_AT_PREFIX) -> {
+                    savedAt = trimmed.removePrefix(CACHE_SAVED_AT_PREFIX).trim().toLongOrNull() ?: 0L
+                    marked = true
+                }
+                trimmed.startsWith("#") -> Unit // format header, ignored
+                else -> pemLines.add(line)
+            }
+        }
+        val pem = pemLines.joinToString("\n").trim()
+        if (pem.isEmpty()) {
+            return null
+        }
+        if (!marked) {
+            // Written by the first version of this hook, which could not distinguish an enabled
+            // from a disabled configuration. Unknown provenance is not trustworthy.
+            Log.i(
+                TAG,
+                "PrivateServerTrust: ignoring the legacy cached CA at ${file.absolutePath} " +
+                        "(no enabled marker; $source)"
+            )
+            deleteCachedCa(file)
+            return null
+        }
+        return CachedCa(pem, enabled, savedAt)
     }
 
     private fun writeCachedCa(context: Context?, pem: String) {
         val ctx = context ?: return
         try {
             val file = File(ctx.filesDir, CACHE_FILE_NAME)
-            if (file.isFile && file.readText() == pem) {
+            val normalized = pem.trim()
+            val now = System.currentTimeMillis()
+            val existing = readCachedCa(file, "cache-write")
+            if (existing != null &&
+                existing.enabled &&
+                existing.pem == normalized &&
+                now - existing.savedAt in 0..CACHE_REFRESH_INTERVAL_MS
+            ) {
                 return
             }
-            file.writeText(pem)
-            Log.i(TAG, "PrivateServerTrust: cached the CA for the next launch (${file.absolutePath})")
+            file.writeText(
+                buildString {
+                    append(CACHE_FORMAT_HEADER).append('\n')
+                    append(CACHE_ENABLED_PREFIX).append("true").append('\n')
+                    append(CACHE_SAVED_AT_PREFIX).append(now).append('\n')
+                    append(normalized).append('\n')
+                }
+            )
+            Log.i(
+                TAG,
+                "PrivateServerTrust: cached the CA for the next launch (enabled marker, " +
+                        "${file.absolutePath})"
+            )
         }
         catch (t: Throwable) {
             Log.w(TAG, "PrivateServerTrust: cannot cache the CA", t)
         }
     }
 
-    private fun deleteCachedCa(context: Context?) {
-        val ctx = context ?: return
-        try {
-            val file = File(ctx.filesDir, CACHE_FILE_NAME)
+    private fun deleteCachedCa(context: Context?): Boolean {
+        val ctx = context ?: return false
+        return deleteCachedCa(File(ctx.filesDir, CACHE_FILE_NAME))
+    }
+
+    private fun deleteCachedCa(file: File): Boolean {
+        return try {
             if (file.isFile && file.delete()) {
-                Log.i(TAG, "PrivateServerTrust: removed the cached CA")
+                Log.i(TAG, "PrivateServerTrust: removed the cached CA (${file.absolutePath})")
+                true
+            }
+            else {
+                false
             }
         }
         catch (t: Throwable) {
             Log.w(TAG, "PrivateServerTrust: cannot remove the cached CA", t)
+            false
         }
     }
 
