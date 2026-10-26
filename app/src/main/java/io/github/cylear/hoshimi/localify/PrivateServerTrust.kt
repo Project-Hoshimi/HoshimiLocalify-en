@@ -58,6 +58,7 @@ object PrivateServerTrust {
     private const val CACHE_FORMAT_HEADER = "# hoshimi-private-server-ca-cache v1"
     private const val CACHE_ENABLED_PREFIX = "# enabled="
     private const val CACHE_SAVED_AT_PREFIX = "# savedAt="
+    private const val CACHE_URL_PREFIX = "# url="
     private const val REQUEST_CONFIG_MARKER = "requestConfig"
     private const val AUGMENT_LOG_INTERVAL_MS = 2000L
 
@@ -86,6 +87,13 @@ object PrivateServerTrust {
     @Volatile
     private var caCerts: List<X509Certificate> = emptyList()
 
+    /**
+     * Private server URL that belongs to [caCerts]; the Java-side redirect
+     * ([PrivateServerRedirect]) needs it to know where to send the Firebase hosts.
+     */
+    @Volatile
+    private var serverUrl: String = ""
+
     @Volatile
     private var cacheFileRead = false
 
@@ -102,6 +110,9 @@ object PrivateServerTrust {
         }
         hookTrustManagerFactory(classLoader)
         hookActivityLaunch(classLoader)
+        // Firebase Auth is the Java SDK: its DNS lookups and Conscrypt handshakes never reach the
+        // native hooks, so the Java-side redirects/trust fallback must be armed just as early.
+        PrivateServerRedirect.install(classLoader)
     }
 
     /** Feeds the configuration carried by the launch intent, before the Unity player exists. */
@@ -155,7 +166,13 @@ object PrivateServerTrust {
         if (config == null) {
             return
         }
-        applyConfig(config.privateServerEnabled, config.privateServerCaPem, source, appContext())
+        applyConfig(
+            config.privateServerEnabled,
+            config.privateServerUrl,
+            config.privateServerCaPem,
+            source,
+            appContext()
+        )
     }
 
     // ---- hooks ---------------------------------------------------------------------------
@@ -375,6 +392,7 @@ object PrivateServerTrust {
 
     private fun applyConfig(
         enabled: Boolean,
+        url: String,
         pem: String,
         source: String,
         context: Context?,
@@ -386,6 +404,8 @@ object PrivateServerTrust {
             // the user has turned off.
             val hadCerts = caCerts.isNotEmpty()
             caCerts = emptyList()
+            serverUrl = ""
+            PrivateServerRedirect.onConfigCleared(source)
             val removed = deleteCachedCa(context)
             if (hadCerts || removed) {
                 Log.i(
@@ -403,9 +423,13 @@ object PrivateServerTrust {
             Log.e(TAG, "PrivateServerTrust: no X.509 certificate in the configured CA PEM ($source)")
             return
         }
+        // The redirect needs both the URL and the CA; a legacy cache without the URL still gets the
+        // trust anchors but leaves the Java redirect off.
+        serverUrl = url.trim()
+        PrivateServerRedirect.onConfigChanged(serverUrl, parsed, source)
         if (sameCerts(parsed, caCerts)) {
             if (updateCache) {
-                writeCachedCa(context, pem)
+                writeCachedCa(context, serverUrl, pem)
             }
             return
         }
@@ -417,7 +441,7 @@ object PrivateServerTrust {
                     "subjects=[${parsed.joinToString { it.subjectX500Principal.name }}]"
         )
         if (updateCache) {
-            writeCachedCa(context, pem)
+            writeCachedCa(context, serverUrl, pem)
         }
     }
 
@@ -460,7 +484,7 @@ object PrivateServerTrust {
 
     // ---- cache ---------------------------------------------------------------------------
 
-    private data class CachedCa(val pem: String, val enabled: Boolean, val savedAt: Long)
+    private data class CachedCa(val pem: String, val url: String, val enabled: Boolean, val savedAt: Long)
 
     /**
      * Launching the game straight from the launcher carries no `iprData` extra. The CA seen on a
@@ -516,7 +540,14 @@ object PrivateServerTrust {
                     "cached at ${file.absolutePath} (age=${if (age >= 0L) "${age / 3_600_000L}h" else "unknown"}; " +
                     "will be revoked when a disabled config arrives)"
         )
-        applyConfig(true, cached.pem, "cache/$source", context, updateCache = false)
+        if (cached.url.isBlank()) {
+            Log.i(
+                TAG,
+                "PrivateServerTrust: the cached CA carries no server URL (written by an older " +
+                        "build); Java-side DNS/port redirect stays off ($source)"
+            )
+        }
+        applyConfig(true, cached.url, cached.pem, "cache/$source", context, updateCache = false)
     }
 
     private fun readCachedCa(file: File, source: String): CachedCa? {
@@ -535,6 +566,7 @@ object PrivateServerTrust {
         }
         var enabled = false
         var savedAt = 0L
+        var url = ""
         var marked = false
         val pemLines = ArrayList<String>()
         for (line in text.lineSequence()) {
@@ -548,6 +580,10 @@ object PrivateServerTrust {
                 trimmed.startsWith(CACHE_SAVED_AT_PREFIX) -> {
                     savedAt = trimmed.removePrefix(CACHE_SAVED_AT_PREFIX).trim().toLongOrNull() ?: 0L
                     marked = true
+                }
+                trimmed.startsWith(CACHE_URL_PREFIX) -> {
+                    // Optional: older caches have no URL, and old builds ignore this unknown header.
+                    url = trimmed.removePrefix(CACHE_URL_PREFIX).trim()
                 }
                 trimmed.startsWith("#") -> Unit // format header, ignored
                 else -> pemLines.add(line)
@@ -568,19 +604,21 @@ object PrivateServerTrust {
             deleteCachedCa(file)
             return null
         }
-        return CachedCa(pem, enabled, savedAt)
+        return CachedCa(pem, url, enabled, savedAt)
     }
 
-    private fun writeCachedCa(context: Context?, pem: String) {
+    private fun writeCachedCa(context: Context?, url: String, pem: String) {
         val ctx = context ?: return
         try {
             val file = File(ctx.filesDir, CACHE_FILE_NAME)
             val normalized = pem.trim()
+            val normalizedUrl = url.trim()
             val now = System.currentTimeMillis()
             val existing = readCachedCa(file, "cache-write")
             if (existing != null &&
                 existing.enabled &&
                 existing.pem == normalized &&
+                existing.url == normalizedUrl &&
                 now - existing.savedAt in 0..CACHE_REFRESH_INTERVAL_MS
             ) {
                 return
@@ -590,6 +628,9 @@ object PrivateServerTrust {
                     append(CACHE_FORMAT_HEADER).append('\n')
                     append(CACHE_ENABLED_PREFIX).append("true").append('\n')
                     append(CACHE_SAVED_AT_PREFIX).append(now).append('\n')
+                    if (normalizedUrl.isNotEmpty()) {
+                        append(CACHE_URL_PREFIX).append(normalizedUrl).append('\n')
+                    }
                     append(normalized).append('\n')
                 }
             )

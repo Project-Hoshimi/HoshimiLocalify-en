@@ -42,6 +42,8 @@ All new logic lives in **new files**:
 
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.hpp`
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.cpp`
+- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerTrust.kt`
+- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerRedirect.kt`
 - `app/src/main/java/io/github/cylear/hoshimi/localify/ui/pages/subPages/PrivateServerPage.kt`
 
 Edits to upstream files stay small and additive:
@@ -73,7 +75,23 @@ When enabled, the mod:
 2. prepends the configured CA to `Api.GetSSLRootCertificates()` so YAHA/rustls trusts it;
 3. rewrites the scheme+authority of `OctoSettings.url` (asset catalog) to the configured URL;
 4. (Phase 2, rootless) rewrites `UnityWebRequest` URLs for the game/Octo hosts and validates
-   the server certificate against the configured CA.
+   the server certificate against the configured CA;
+5. redirects the **Java** Firebase Auth traffic (`identitytoolkit.googleapis.com`,
+   `securetoken.googleapis.com`, `www.googleapis.com`): `InetAddress` lookups return the
+   private server's address while keeping the googleapis hostname (so SNI/hostname checks
+   still match the server certificate), `Socket.connect` rewrites `:443` to the server port,
+   and `TrustManagerImpl.checkServerTrusted` falls back to the configured CA only for those
+   hosts.
+
+### Java-side (Firebase Auth) redirect
+
+Firebase Auth on Android is the Java SDK, called over JNI from the Unity Firebase C++ SDK, so
+the native `getaddrinfo`/`connect` hooks never see it. `PrivateServerRedirect.kt` closes that
+gap; it is armed from `PrivateServerTrust` with the same enabled switch, server URL and CA and
+has no settings of its own. The trust fallback never blanket-trusts: it accepts a chain only
+when it validates (PKIX, revocation off) against a trust store built exclusively from the
+configured private-server CA, and otherwise rethrows the platform verdict. Hosts are listed in
+`BASE_REDIRECT_HOSTS` and must stay in sync with `g_redirectHosts` in `PrivateServer.cpp`.
 
 ## Private-server setup for players
 
@@ -107,6 +125,7 @@ the mod; it is documented in `sumire-sr/docs/CLIENT_SETUP.md`.
 | Config fields, settings page (EN/KO) | done, builds |
 | `Api.GetHost` / `Api.GetSSLRootCertificates` / `OctoSettings.url` hooks | done, builds |
 | `UnityWebRequest` URL rewrite + `CertificateHandler` pin | done, builds, not yet verified on a device |
+| Firebase Auth redirect (native hosts + Java DNS/port/TLS) | done, builds, not yet verified on a device |
 | sumire-sr `PUBLIC_BASE_URL` | done, `npm run typecheck` clean |
 | on-device E2E, LSPatch | blocked: no test device here |
 

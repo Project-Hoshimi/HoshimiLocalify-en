@@ -679,7 +679,13 @@ namespace HoshimiLocal::PrivateServer {
             HoshimiLocal::Log::ErrorFmt("PrivateServer: cannot parse the endpoint of %s", g_baseUrl.c_str());
         }
 
-        g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com"};
+        // Firebase Auth runs as the Java SDK inside the game process, so the hooks below only cover
+        // the refresh calls that go out through UnityWebRequest / native code; the Kotlin-side
+        // InetAddress redirect (PrivateServerRedirect.kt) mirrors this list for java.net. Both
+        // lists must stay in sync.
+        g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com",
+                           "identitytoolkit.googleapis.com", "securetoken.googleapis.com",
+                           "www.googleapis.com"};
         // The configured authority only needs to be known as a redirect host in handler mode, when
         // it is a hostname; an IPv4 endpoint is reached directly and would only clutter the list.
         if (!g_baseHost.empty() && !IsIpv4Literal(g_baseHost)
