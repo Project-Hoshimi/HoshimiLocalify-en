@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -520,7 +521,6 @@ namespace HoshimiLocal::PrivateServer {
     // returned sockaddr is forced to g_basePortNumber regardless of the requested service.
     using GetAddrInfoType = int (*)(const char*, const char*, const struct addrinfo*, struct addrinfo**);
     static GetAddrInfoType GetAddrInfo_Orig = nullptr;
-    static std::atomic<int> g_resolveLogCount{0};
 
     static void ForceResolvedPort(struct addrinfo* list) {
         for (auto* ai = list; ai != nullptr; ai = ai->ai_next) {
@@ -561,22 +561,101 @@ namespace HoshimiLocal::PrivateServer {
         // socket aimed at <host>:443 where nothing is listening.
         const int result = GetAddrInfo_Orig(g_baseAddress.c_str(), g_basePort.c_str(), effectiveHints, res);
         if (result != 0) {
-            const int failures = g_resolveLogCount.fetch_add(1) + 1;
-            if (failures <= 10) {
-                HoshimiLocal::Log::ErrorFmt("PrivateServer: resolve %s:%s -> %s:%u failed: %d",
-                                            node, service ? service : "(null)", g_baseAddress.c_str(),
-                                            g_basePortNumber, result);
-            }
+            HoshimiLocal::Log::ErrorFmt("PrivateServer: resolve %s:%s -> %s:%u failed: %d",
+                                        node, service ? service : "(null)", g_baseAddress.c_str(),
+                                        g_basePortNumber, result);
             return result;
         }
         ForceResolvedPort(*res);
-        const int count = g_resolveLogCount.fetch_add(1) + 1;
-        if (count <= 10) {
-            HoshimiLocal::Log::InfoFmt("PrivateServer: resolve %s:%s -> %s:%u",
-                                       node, service ? service : "(null)", g_baseAddress.c_str(),
-                                       g_basePortNumber);
-        }
+        // Log every resolution for a redirected host (not once per host): this is one of the lines
+        // that tells the next device run which DNS layer actually fired.
+        HoshimiLocal::Log::InfoFmt("PrivateServer: resolve %s:%s -> %s:%u",
+                                   node, service ? service : "(null)", g_baseAddress.c_str(),
+                                   g_basePortNumber);
         return 0;
+    }
+
+    // libcore's name resolution does not go through the public getaddrinfo(): Java's
+    // Inet6AddressImpl/android_getaddrinfo ends up in bionic's android_getaddrinfofornet (or
+    // android_getaddrinfofornetcontext on newer releases). The framework okhttp /
+    // HttpsURLConnection stack used by Firebase Auth resolves there, so hooking those exported libc
+    // symbols gives in-process Java traffic the same redirect as GetAddrInfo_Hook. ShadowHook uses
+    // inline hooks, therefore calls from libjavacore.so / libopenjdk.so are covered as well.
+    using AndroidGetAddrInfoForNetType = int (*)(const char*, const char*, const struct addrinfo*,
+                                                 unsigned, int, struct addrinfo**);
+    static AndroidGetAddrInfoForNetType AndroidGetAddrInfoForNet_Orig = nullptr;
+
+    using AndroidGetAddrInfoForNetContextType = int (*)(const char*, const char*,
+                                                        const struct addrinfo*, const void*,
+                                                        struct addrinfo**);
+    static AndroidGetAddrInfoForNetContextType AndroidGetAddrInfoForNetContext_Orig = nullptr;
+
+    static bool ShouldRedirectLibcoreResolve(const char* node) {
+        return g_preserveHost && !g_baseAddress.empty() && g_basePortNumber != 0 && node && *node
+                && !IsIpv4Literal(node) && IsRedirectHost(NormalizeHostName(node));
+    }
+
+    // Resolves the private server through the supplied original entry point, forces the private
+    // port and keeps the requested host name (the caller only receives the address, so SNI and
+    // certificate verification are untouched).
+    template <typename Resolve>
+    static int ResolveLibcoreRedirected(const char* node, const char* service,
+                                        const struct addrinfo* hints, struct addrinfo** res,
+                                        Resolve&& resolve) {
+        struct addrinfo adjustedHints {};
+        const struct addrinfo* effectiveHints = hints;
+        if (hints && hints->ai_family == AF_INET6) {
+            adjustedHints = *hints;
+            adjustedHints.ai_family = AF_UNSPEC;
+            effectiveHints = &adjustedHints;
+        }
+        const int result = resolve(g_baseAddress.c_str(), g_basePort.c_str(), effectiveHints, res);
+        if (result != 0) {
+            HoshimiLocal::Log::ErrorFmt("PrivateServer: libcore resolve %s:%s -> %s:%u failed: %d",
+                                        node, service ? service : "(null)", g_baseAddress.c_str(),
+                                        g_basePortNumber, result);
+            return result;
+        }
+        ForceResolvedPort(*res);
+        HoshimiLocal::Log::InfoFmt("PrivateServer: libcore resolve %s:%s -> %s:%u",
+                                   node, service ? service : "(null)", g_baseAddress.c_str(),
+                                   g_basePortNumber);
+        return 0;
+    }
+
+    static int AndroidGetAddrInfoForNet_Hook(const char* node, const char* service,
+                                             const struct addrinfo* hints, unsigned netId, int mark,
+                                             struct addrinfo** res) {
+        if (!AndroidGetAddrInfoForNet_Orig) {
+            errno = EADDRNOTAVAIL;
+            return EAI_FAIL;
+        }
+        if (!ShouldRedirectLibcoreResolve(node)) {
+            return AndroidGetAddrInfoForNet_Orig(node, service, hints, netId, mark, res);
+        }
+        return ResolveLibcoreRedirected(
+                node, service, hints, res,
+                [&](const char* n, const char* s, const struct addrinfo* h, struct addrinfo** r) {
+                    return AndroidGetAddrInfoForNet_Orig(n, s, h, netId, mark, r);
+                });
+    }
+
+    static int AndroidGetAddrInfoForNetContext_Hook(const char* node, const char* service,
+                                                    const struct addrinfo* hints,
+                                                    const void* netContext,
+                                                    struct addrinfo** res) {
+        if (!AndroidGetAddrInfoForNetContext_Orig) {
+            errno = EADDRNOTAVAIL;
+            return EAI_FAIL;
+        }
+        if (!ShouldRedirectLibcoreResolve(node)) {
+            return AndroidGetAddrInfoForNetContext_Orig(node, service, hints, netContext, res);
+        }
+        return ResolveLibcoreRedirected(
+                node, service, hints, res,
+                [&](const char* n, const char* s, const struct addrinfo* h, struct addrinfo** r) {
+                    return AndroidGetAddrInfoForNetContext_Orig(n, s, h, netContext, r);
+                });
     }
 
     // Rust's resolver (gRPC/YAHA) calls getaddrinfo(host, NULL) and stamps port 443 on the result
@@ -584,21 +663,42 @@ namespace HoshimiLocal::PrivateServer {
     // rewriting exactly <g_baseAddress>:443 -> <g_baseAddress>:<port> touches no other traffic.
     using ConnectType = int (*)(int, const struct sockaddr*, socklen_t);
     static ConnectType Connect_Orig = nullptr;
-    static std::atomic<int> g_connectLogCount{0};
     static in_addr_t g_baseAddressNet = 0;
 
+    // Java sockets on Android are dual-stack AF_INET6 sockets, so libcore hands bionic an
+    // IPv4-mapped IPv6 sockaddr (::ffff:<server>, 443) even though the address is IPv4. Both
+    // families must be handled or Java traffic keeps connecting to 443 (the native game socket that
+    // *was* rewritten used a plain AF_INET sockaddr).
     static int Connect_Hook(int fd, const struct sockaddr* addr, socklen_t len) {
-        if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in) && g_baseAddressNet != 0
-                && g_basePortNumber != 0 && g_basePortNumber != 443) {
+        if (!addr || g_baseAddressNet == 0 || g_basePortNumber == 0 || g_basePortNumber == 443) {
+            return Connect_Orig(fd, addr, len);
+        }
+        if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
             const auto* in = reinterpret_cast<const struct sockaddr_in*>(addr);
             if (in->sin_addr.s_addr == g_baseAddressNet && in->sin_port == htons(443)) {
                 struct sockaddr_in patched = *in;
                 patched.sin_port = htons(g_basePortNumber);
-                if (g_connectLogCount.fetch_add(1) < 10) {
-                    HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u", g_baseAddress.c_str(),
-                                               g_baseAddress.c_str(), g_basePortNumber);
-                }
+                // Log every rewrite, not just the first ten: the port layer must be visible.
+                HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u", g_baseAddress.c_str(),
+                                           g_baseAddress.c_str(), g_basePortNumber);
                 return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&patched), sizeof(patched));
+            }
+        }
+        else if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+            const auto* in6 = reinterpret_cast<const struct sockaddr_in6*>(addr);
+            if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr) && in6->sin6_port == htons(443)) {
+                struct in_addr mapped {};
+                std::memcpy(&mapped.s_addr, in6->sin6_addr.s6_addr + 12, sizeof(mapped.s_addr));
+                if (mapped.s_addr == g_baseAddressNet) {
+                    // Keep the sockaddr family/scope: only the port changes, so the kernel still
+                    // sees the dual-stack socket the caller expected.
+                    struct sockaddr_in6 patched = *in6;
+                    patched.sin6_port = htons(g_basePortNumber);
+                    HoshimiLocal::Log::InfoFmt("PrivateServer: connect %s:443 -> %s:%u (v4-mapped inet6)",
+                                               g_baseAddress.c_str(), g_baseAddress.c_str(),
+                                               g_basePortNumber);
+                    return Connect_Orig(fd, reinterpret_cast<const struct sockaddr*>(&patched), sizeof(patched));
+                }
             }
         }
         return Connect_Orig(fd, addr, len);
@@ -679,7 +779,13 @@ namespace HoshimiLocal::PrivateServer {
             HoshimiLocal::Log::ErrorFmt("PrivateServer: cannot parse the endpoint of %s", g_baseUrl.c_str());
         }
 
-        g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com"};
+        // Firebase Auth runs as the Java SDK inside the game process, so the hooks below only cover
+        // the refresh calls that go out through UnityWebRequest / native code; the Kotlin-side
+        // InetAddress redirect (PrivateServerRedirect.kt) mirrors this list for java.net. Both
+        // lists must stay in sync.
+        g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com",
+                           "identitytoolkit.googleapis.com", "securetoken.googleapis.com",
+                           "www.googleapis.com"};
         // The configured authority only needs to be known as a redirect host in handler mode, when
         // it is a hostname; an IPv4 endpoint is reached directly and would only clutter the list.
         if (!g_baseHost.empty() && !IsIpv4Literal(g_baseHost)
@@ -732,12 +838,20 @@ namespace HoshimiLocal::PrivateServer {
             };
             // getaddrinfo points the game hosts at g_baseAddress; connect() only fixes up the port for
             // callers (Rust) that discard the resolved port. Non-game traffic never matches either.
+            // The android_getaddrinfo* entry points cover Java/libcore (framework okhttp, Firebase
+            // Auth), which bypasses the public getaddrinfo().
             in_addr parsed {};
             if (inet_pton(AF_INET, g_baseAddress.c_str(), &parsed) == 1) g_baseAddressNet = parsed.s_addr;
             installSymbolHook("libc.so", "getaddrinfo", reinterpret_cast<void*>(&GetAddrInfo_Hook),
                               reinterpret_cast<void**>(&GetAddrInfo_Orig));
             installSymbolHook("libc.so", "connect", reinterpret_cast<void*>(&Connect_Hook),
                               reinterpret_cast<void**>(&Connect_Orig));
+            installSymbolHook("libc.so", "android_getaddrinfofornet",
+                              reinterpret_cast<void*>(&AndroidGetAddrInfoForNet_Hook),
+                              reinterpret_cast<void**>(&AndroidGetAddrInfoForNet_Orig));
+            installSymbolHook("libc.so", "android_getaddrinfofornetcontext",
+                              reinterpret_cast<void*>(&AndroidGetAddrInfoForNetContext_Hook),
+                              reinterpret_cast<void**>(&AndroidGetAddrInfoForNetContext_Orig));
         }
         else {
             HoshimiLocal::Log::Info("PrivateServer: URL authority replaced, validation via CertificateHandler");
