@@ -266,7 +266,13 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
             // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
             // configuration is seen (usually a no-op, the launch intent already delivered it).
-            PrivateServerTrust.observeConfig(initConfig, "iprData")
+            // A malformed payload decodes to null and is ignored by the trust layer.
+            try {
+                PrivateServerTrust.observeConfig(initConfig, "iprData")
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA from iprData", t)
+            }
             val programConfig = try {
                 if (programData == null) {
                     ProgramConfig()
@@ -397,7 +403,16 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         iprDataInited = true
         FilesChecker.initAndCheck(context.filesDir, modulePath)
-        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), IdolyprideConfig()))
+        val defaultConfig = IdolyprideConfig()
+        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), defaultConfig))
+        // No module app answered the config request, so the only known configuration is the
+        // default one (private server off). Do not keep a CA cached by an earlier launch alive.
+        try {
+            PrivateServerTrust.observeConfig(defaultConfig, "standalone")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot clear the private server CA in standalone mode", t)
+        }
         Log.i(TAG, "Loaded default configuration in standalone mode.")
     }
 
