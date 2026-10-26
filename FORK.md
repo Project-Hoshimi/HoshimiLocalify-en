@@ -42,6 +42,8 @@ All new logic lives in **new files**:
 
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.hpp`
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.cpp`
+- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerTrust.kt`
+- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerRedirect.kt`
 - `app/src/main/java/io/github/cylear/hoshimi/localify/ui/pages/subPages/PrivateServerPage.kt`
 
 Edits to upstream files stay small and additive:
@@ -73,6 +75,57 @@ When enabled, the mod:
 2. prepends the configured CA to `Api.GetSSLRootCertificates()` so YAHA/rustls trusts it;
 3. rewrites the scheme+authority of `OctoSettings.url` (asset catalog) to the configured URL;
 4. (Phase 2, rootless) rewrites `UnityWebRequest` URLs for the game/Octo hosts and validates
-   the server certificate against the configured CA.
+   the server certificate against the configured CA;
+5. redirects the **Java** Firebase Auth traffic (`identitytoolkit.googleapis.com`,
+   `securetoken.googleapis.com`, `www.googleapis.com`): `InetAddress` lookups return the
+   private server's address while keeping the googleapis hostname (so SNI/hostname checks
+   still match the server certificate), `Socket.connect` rewrites `:443` to the server port,
+   and `TrustManagerImpl.checkServerTrusted` falls back to the configured CA only for those
+   hosts.
 
-The Frida path (`sumire-sr/frida/e2e_hooks.js`) remains the supported fallback.
+### Java-side (Firebase Auth) redirect
+
+Firebase Auth on Android is the Java SDK, called over JNI from the Unity Firebase C++ SDK, so
+the native `getaddrinfo`/`connect` hooks never see it. `PrivateServerRedirect.kt` closes that
+gap; it is armed from `PrivateServerTrust` with the same enabled switch, server URL and CA and
+has no settings of its own. The trust fallback never blanket-trusts: it accepts a chain only
+when it validates (PKIX, revocation off) against a trust store built exclusively from the
+configured private-server CA, and otherwise rethrows the platform verdict. Hosts are listed in
+`BASE_REDIRECT_HOSTS` and must stay in sync with `g_redirectHosts` in `PrivateServer.cpp`.
+
+## Private-server setup for players
+
+1. Install this fork's APK (same package as the `-en` build, so uninstall or upgrade it,
+   not both).
+2. Enable the module for `game.qualiarts.idolypride` in LSPosed.
+3. Open the mod app, go to the **Private server** tab.
+4. **Server URL**: scheme, host and port with no trailing slash, e.g.
+   `https://sumire.lan:8443`. The host must be one of the DNS names or IPs in the
+   server certificate (the SANs in `sumire-sr/tls/api.ext`).
+5. **Server CA PEM**: paste the whole contents of `sumire-sr/tls/ca.crt`, including the
+   `BEGIN`/`END` lines. One or more certificates are accepted.
+6. Turn the switch on, force-stop the game, and launch it **from the mod app** so the
+   config reaches the game process. Launching from the home screen still works through
+   the fallback config request in most cases.
+7. Server side: run sumire-sr with `TLS=1 HTTP2=1 PORT=8443
+   PUBLIC_BASE_URL=https://sumire.lan:8443`, or master downloads will point at the
+   official host.
+
+Leave the switch off for the official servers: with it off no hooks are installed and the
+game behaves exactly like the `-en` build. Only point the mod at a server you control —
+the CA you paste is trusted for every request the redirected hosts make.
+
+The Frida redirect in `sumire-sr/frida/` is the fallback path for rooted devices without
+the mod; it is documented in `sumire-sr/docs/CLIENT_SETUP.md`.
+
+## Status
+
+| Piece | State |
+|---|---|
+| Config fields, settings page (EN/KO) | done, builds |
+| `Api.GetHost` / `Api.GetSSLRootCertificates` / `OctoSettings.url` hooks | done, builds |
+| `UnityWebRequest` URL rewrite + `CertificateHandler` pin | done, builds, not yet verified on a device |
+| Firebase Auth redirect (native hosts + Java DNS/port/TLS) | done, builds, not yet verified on a device |
+| sumire-sr `PUBLIC_BASE_URL` | done, `npm run typecheck` clean |
+| on-device E2E, LSPatch | blocked: no test device here |
+

@@ -37,6 +37,10 @@ namespace HoshimiLocal::Config {
 
     bool loginAsIOS = false;
 
+    bool privateServerEnabled = false;
+    std::string privateServerUrl = "";
+    std::string privateServerCaPem = "";
+
     bool useCustomeGraphicSettings = false;
     float renderScale = 0.77f;
     int qualitySettingsLevel = 3;
@@ -112,6 +116,9 @@ namespace HoshimiLocal::Config {
             GetConfigItem(liveCustomeHeadId);
             GetConfigItem(liveCustomeCostumeId);
             GetConfigItem(loginAsIOS);
+            GetConfigItem(privateServerEnabled);
+            GetConfigItem(privateServerUrl);
+            GetConfigItem(privateServerCaPem);
             GetConfigItem(useCustomeGraphicSettings);
             GetConfigItem(renderScale);
             GetConfigItem(qualitySettingsLevel);
@@ -178,6 +185,9 @@ namespace HoshimiLocal::Config {
             SetConfigItem(liveCustomeHeadId);
             SetConfigItem(liveCustomeCostumeId);
             SetConfigItem(loginAsIOS);
+            SetConfigItem(privateServerEnabled);
+            SetConfigItem(privateServerUrl);
+            SetConfigItem(privateServerCaPem);
             SetConfigItem(useCustomeGraphicSettings);
             SetConfigItem(renderScale);
             SetConfigItem(qualitySettingsLevel);

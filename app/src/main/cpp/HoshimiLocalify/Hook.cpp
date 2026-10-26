@@ -5,6 +5,7 @@
 #include "Log.h"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 #include "Il2cppUtils.hpp"
+#include "PrivateServer.hpp"
 #include "Local.h"
 #include "MasterLocal.h"
 #include "StoryDict.hpp"
@@ -6218,6 +6219,8 @@ namespace HoshimiLocal::HookMain {
                 ADD_HOOK(ApiBase_get_Instance, Il2cppUtils::il2cpp_class_get_method_pointer_from_name(api_parent, "get_Instance", 0));
             }
         }
+
+        PrivateServer::Install(hookInstaller);
 
         ADD_HOOK(SolisQualityManager_set_TargetFrameRate,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",

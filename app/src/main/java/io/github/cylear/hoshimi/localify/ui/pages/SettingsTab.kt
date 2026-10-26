@@ -33,6 +33,7 @@ import io.github.cylear.hoshimi.localify.ui.components.icons.AutoFixHigh
 import io.github.cylear.hoshimi.localify.ui.pages.subPages.AboutPage
 import io.github.cylear.hoshimi.localify.ui.pages.subPages.AdvanceSettingsPage
 import io.github.cylear.hoshimi.localify.ui.pages.subPages.HomePage
+import io.github.cylear.hoshimi.localify.ui.pages.subPages.PrivateServerPage
 
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -61,6 +62,7 @@ fun SettingsTabs(modifier: Modifier = Modifier,
                     0 -> AboutPage(modifier, context = context, previewData = previewData, screenH = screenH)
                     1 -> HomePage(modifier, context = context, previewData = previewData, screenH = screenH)
                     2 -> AdvanceSettingsPage(modifier, context = context, previewData = previewData, screenH = screenH)
+                    3 -> PrivateServerPage(modifier, context = context, previewData = previewData, screenH = screenH)
                 }
             }
         }

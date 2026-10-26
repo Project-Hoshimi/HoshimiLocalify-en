@@ -18,6 +18,9 @@ interface ConfigListener {
     fun onEnabledChanged(value: Boolean)
     fun onForceExportResourceChanged(value: Boolean)
     fun onLoginAsIOSChanged(value: Boolean)
+    fun onPrivateServerEnabledChanged(value: Boolean)
+    fun onPrivateServerUrlChanged(value: String)
+    fun onPrivateServerCaPemChanged(value: String)
     fun onTextTestChanged(value: Boolean)
     fun onUseMasterTransChanged(value: Boolean)
     fun onReplaceFontChanged(value: Boolean)
@@ -127,6 +130,21 @@ interface ConfigUpdateListener: ConfigListener, IHasConfigItems {
 
     override fun onLoginAsIOSChanged(value: Boolean) {
         config.loginAsIOS = value
+        saveConfig()
+    }
+
+    override fun onPrivateServerEnabledChanged(value: Boolean) {
+        config.privateServerEnabled = value
+        saveConfig()
+    }
+
+    override fun onPrivateServerUrlChanged(value: String) {
+        config.privateServerUrl = value.trim().trimEnd('/')
+        saveConfig()
+    }
+
+    override fun onPrivateServerCaPemChanged(value: String) {
+        config.privateServerCaPem = value
         saveConfig()
     }
 
