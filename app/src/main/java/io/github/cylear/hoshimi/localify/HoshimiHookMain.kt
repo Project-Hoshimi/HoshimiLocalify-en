@@ -75,6 +75,11 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
 
+        // Installed before the process runs any game code: libunity.so resolves the UnityTLS root
+        // list over JNI (TrustManagerFactory.getTrustManagers -> getAcceptedIssuers) and caches it,
+        // so the hooks must exist before the Unity player starts networking.
+        PrivateServerTrust.install(lpparam.classLoader)
+
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
@@ -259,6 +264,9 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             catch (e: Exception) {
                 null
             }
+            // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
+            // configuration is seen (usually a no-op, the launch intent already delivered it).
+            PrivateServerTrust.observeConfig(initConfig, "iprData")
             val programConfig = try {
                 if (programData == null) {
                     ProgramConfig()
