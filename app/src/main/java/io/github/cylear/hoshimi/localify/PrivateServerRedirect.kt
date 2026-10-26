@@ -33,10 +33,15 @@ import javax.net.ssl.X509TrustManager
  * happen in `java.net.InetAddress` and its TLS handshakes use Conscrypt's
  * `com.android.org.conscrypt.TrustManagerImpl`. Neither is covered by the native hooks, therefore:
  *
- *  1. [hookNameResolution] redirects `InetAddress.getByName` / `getAllByName` for the Firebase
- *     hosts (and the existing game hosts) to the private server's address. The returned
- *     `InetAddress` keeps the *googleapis* hostname (via `InetAddress.getByAddress(hostname, ...)`),
- *     so TLS SNI and Conscrypt's hostname verification still see the certificate's SAN.
+ *  1. [hookNameResolution] redirects DNS for the Firebase hosts (and the existing game hosts) to
+ *     the private server's address. It hooks every Java layer a lookup can pass through:
+ *     `InetAddress.getByName`/`getAllByName`, the hidden `getByNameOnNet`/`getAllByNameOnNet`
+ *     implementations, `java.net.Inet6AddressImpl.lookupAllHostAddr` and
+ *     `libcore.io.Linux`/`libcore.io.ForwardingOs.android_getaddrinfo`. The framework
+ *     `okhttp`/`HttpsURLConnection` used by Firebase Auth does not necessarily call the public
+ *     wrappers, which is why the lower layers matter. The returned `InetAddress` keeps the
+ *     *googleapis* hostname (via `InetAddress.getByAddress(hostname, ...)`), so TLS SNI and
+ *     Conscrypt's hostname verification still see the certificate's SAN.
  *  2. [hookSocketConnect] rewrites `<server address>:443` to `<server address>:<server port>` at
  *     `java.net.Socket.connect`. The native `connect` hook does the same for libc sockets, but it
  *     is only installed in preserve-host mode (see `PrivateServer.cpp`), so Java sockets need their
@@ -91,10 +96,12 @@ object PrivateServerRedirect {
     @Volatile
     private var getByNameMethod: Method? = null
 
-    private val loggedRedirects = ConcurrentHashMap.newKeySet<String>()
-    private val loggedTrustFallbacks = ConcurrentHashMap.newKeySet<String>()
     private val loggedTrustFailures = ConcurrentHashMap.newKeySet<String>()
     private val loggedErrors = ConcurrentHashMap.newKeySet<String>()
+
+    /** Runtime class of `InetAddress[]`, shared by every DNS hook that returns an address list. */
+    private val inetAddressArrayClass: Class<*> =
+        java.lang.reflect.Array.newInstance(InetAddress::class.java, 0).javaClass
 
     // ---- installation --------------------------------------------------------------------
 
@@ -107,7 +114,7 @@ object PrivateServerRedirect {
         if (!installed.compareAndSet(false, true)) {
             return
         }
-        hookNameResolution()
+        hookNameResolution(classLoader)
         hookSocketConnect()
         hookPlatformTrustManager(classLoader)
     }
@@ -162,69 +169,121 @@ object PrivateServerRedirect {
 
     // ---- DNS -----------------------------------------------------------------------------
 
-    private fun hookNameResolution() {
-        val clazz = InetAddress::class.java
-        val getByName = try {
-            XposedHelpers.findMethodExact(clazz, "getByName", String::class.java)
-        }
-        catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerRedirect: cannot find InetAddress.getByName(String)", t)
-            null
-        }
-        val getAllByName = try {
-            XposedHelpers.findMethodExact(clazz, "getAllByName", String::class.java)
-        }
-        catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerRedirect: cannot find InetAddress.getAllByName(String)", t)
-            null
-        }
-        getByNameMethod = getByName
+    private fun hookNameResolution(classLoader: ClassLoader) {
+        hookInetAddressMethods(classLoader)
+        hookInet6AddressImpl(classLoader)
+        hookLibcoreGetAddrInfo(classLoader, "libcore.io.Linux")
+        hookLibcoreGetAddrInfo(classLoader, "libcore.io.ForwardingOs")
+    }
 
-        if (getByName != null) {
-            try {
-                XposedBridge.hookMethod(getByName, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val host = param.args.getOrNull(0) as? String ?: return
-                            val rewritten = rewriteLookup(host) ?: return
-                            param.setResult(rewritten[0])
-                        }
-                        catch (t: Throwable) {
-                            Log.w(TAG, "PrivateServerRedirect: getByName hook failed", t)
-                        }
-                    }
-                })
-                Log.i(TAG, "PrivateServerRedirect: hooked InetAddress.getByName")
+    /**
+     * Public/hidden `InetAddress` entry points. The public ones cover callers that resolve through
+     * `getByName`/`getAllByName`; the hidden `*OnNet` variants are the actual implementation on
+     * Android 7+ and are hooked as well, so a caller that skips the public wrapper (and the
+     * `AddressCache` lookup inside it) still gets the redirect.
+     */
+    private fun hookInetAddressMethods(classLoader: ClassLoader) {
+        val clazz = findClass("java.net.InetAddress", classLoader) ?: return
+        var hooked = 0
+        val intClass = Int::class.javaPrimitiveType
+        for (method in clazz.declaredMethods) {
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.isEmpty() || parameterTypes[0] != String::class.java) continue
+            val onNet = method.name == "getByNameOnNet" || method.name == "getAllByNameOnNet"
+            if (onNet) {
+                if (parameterTypes.size != 2 || parameterTypes[1] != intClass) continue
             }
-            catch (t: Throwable) {
-                Log.w(TAG, "PrivateServerRedirect: cannot hook InetAddress.getByName", t)
+            else if (parameterTypes.size != 1) {
+                continue
+            }
+
+            val single: Boolean
+            if (method.name == "getByName" || method.name == "getByNameOnNet") {
+                if (method.returnType != InetAddress::class.java) continue
+                single = true
+            }
+            else if (method.name == "getAllByName" || method.name == "getAllByNameOnNet") {
+                if (method.returnType != inetAddressArrayClass) continue
+                single = false
+            }
+            else {
+                continue
+            }
+
+            if (method.name == "getByName") {
+                getByNameMethod = method
+            }
+            if (hookMethod(method, nameLookupHook("InetAddress.${method.name}", single))) {
+                hooked++
             }
         }
-
-        if (getAllByName != null) {
-            try {
-                XposedBridge.hookMethod(getAllByName, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val host = param.args.getOrNull(0) as? String ?: return
-                            val rewritten = rewriteLookup(host) ?: return
-                            param.setResult(rewritten)
-                        }
-                        catch (t: Throwable) {
-                            Log.w(TAG, "PrivateServerRedirect: getAllByName hook failed", t)
-                        }
-                    }
-                })
-                Log.i(TAG, "PrivateServerRedirect: hooked InetAddress.getAllByName")
-            }
-            catch (t: Throwable) {
-                Log.w(TAG, "PrivateServerRedirect: cannot hook InetAddress.getAllByName", t)
-            }
+        if (hooked == 0) {
+            Log.w(TAG, "PrivateServerRedirect: no InetAddress name-resolution method was hooked")
         }
     }
 
+    /**
+     * `Inet6AddressImpl.lookupAllHostAddr` is the native method every libcore name lookup ends in,
+     * including the ones from the framework `okhttp`/`HttpsURLConnection` stack used by Firebase
+     * Auth. The returned addresses keep the requested host name, so SNI and certificate hostname
+     * verification still see the googleapis name. Every overload is hooked because the signature
+     * gained a `netId` parameter over the years.
+     */
+    private fun hookInet6AddressImpl(classLoader: ClassLoader) {
+        val clazz = findClass("java.net.Inet6AddressImpl", classLoader) ?: return
+        var hooked = 0
+        for (method in clazz.declaredMethods) {
+            if (method.name != "lookupAllHostAddr") continue
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.isEmpty() || parameterTypes[0] != String::class.java) continue
+            if (method.returnType != inetAddressArrayClass) continue
+            if (hookMethod(method, nameLookupHook("Inet6AddressImpl.lookupAllHostAddr", single = false))) {
+                hooked++
+            }
+        }
+        if (hooked == 0) {
+            Log.w(TAG, "PrivateServerRedirect: no Inet6AddressImpl.lookupAllHostAddr overload was hooked")
+        }
+    }
+
+    /**
+     * libcore's `Linux`/`ForwardingOs.android_getaddrinfo` is the Java-visible layer directly above
+     * bionic's `android_getaddrinfofornet(3)`. Hooking it (plus the libc symbols on the native side)
+     * covers every Android release, even when the concrete `Inet6AddressImpl` class changes.
+     */
+    private fun hookLibcoreGetAddrInfo(classLoader: ClassLoader, className: String) {
+        val clazz = findClass(className, classLoader) ?: return
+        var hooked = 0
+        for (method in clazz.declaredMethods) {
+            if (method.name != "android_getaddrinfo") continue
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.isEmpty() || parameterTypes[0] != String::class.java) continue
+            if (method.returnType != inetAddressArrayClass) continue
+            if (hookMethod(method, nameLookupHook("$className.android_getaddrinfo", single = false))) {
+                hooked++
+            }
+        }
+        if (hooked == 0) {
+            Log.i(TAG, "PrivateServerRedirect: $className declares no hookable android_getaddrinfo")
+        }
+    }
+
+    private fun nameLookupHook(label: String, single: Boolean): XC_MethodHook =
+        object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    val host = param.args.getOrNull(0) as? String ?: return
+                    val rewritten = rewriteLookup(host, label) ?: return
+                    param.setResult(if (single) rewritten[0] else rewritten)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "PrivateServerRedirect: $label hook failed: ${failureText(t)}", t)
+                }
+            }
+        }
+
     /** Returns the replacement address(es), or null when the lookup must be left alone. */
-    private fun rewriteLookup(hostname: String): Array<InetAddress>? {
+    private fun rewriteLookup(hostname: String, layer: String): Array<InetAddress>? {
         if (!active.get()) return null
         if (resolving.get() == true) return null
         val normalized = normalizeHost(hostname)
@@ -239,7 +298,8 @@ object PrivateServerRedirect {
             logErrorOnce("dns:$normalized", "cannot build the redirected InetAddress for $hostname", t)
             return null
         }
-        logRedirectOnce(normalized, "dns")
+        // Log every single lookup (not once per host) so the next device run shows which layer fires.
+        Log.i(TAG, "PrivateServerRedirect: dns[$layer] redirect $hostname -> $serverHost:$serverPort")
         return arrayOf(mapped)
     }
 
@@ -266,26 +326,47 @@ object PrivateServerRedirect {
     }
 
     private fun hookConnectOn(clazz: Class<*>) {
-        try {
-            val hookCount = XposedBridge.hookAllMethods(clazz, "connect", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    try {
-                        val target = param.args.getOrNull(0) as? SocketAddress ?: return
-                        val requestedPort = (param.args.getOrNull(1) as? Int)
-                            ?: (target as? InetSocketAddress)?.port
-                            ?: return
-                        val rewritten = rewriteConnectTarget(target, requestedPort) ?: return
-                        param.args[0] = rewritten
-                    }
-                    catch (t: Throwable) {
-                        Log.w(TAG, "PrivateServerRedirect: Socket.connect hook failed", t)
-                    }
-                }
-            })
-            Log.i(TAG, "PrivateServerRedirect: hooked ${clazz.name}.connect ($hookCount method(s))")
+        var hooked = 0
+        for (method in connectMethods(clazz)) {
+            if (hookMethod(method, connectHook)) {
+                hooked++
+            }
         }
-        catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerRedirect: cannot hook ${clazz.name}.connect", t)
+        if (hooked == 0) {
+            Log.i(TAG, "PrivateServerRedirect: ${clazz.name} declares no hookable connect(SocketAddress[, int])")
+        }
+    }
+
+    /** `connect` overloads from the class and its superclasses (Conscrypt subclasses override it). */
+    private fun connectMethods(clazz: Class<*>): List<Method> {
+        val methods = ArrayList<Method>()
+        var current: Class<*>? = clazz
+        while (current != null && current != Any::class.java) {
+            for (method in current.declaredMethods) {
+                if (method.name != "connect") continue
+                val parameterTypes = method.parameterTypes
+                if (parameterTypes.isEmpty() || parameterTypes[0] != SocketAddress::class.java) continue
+                if (parameterTypes.size > 2) continue
+                methods.add(method)
+            }
+            current = current.superclass
+        }
+        return methods
+    }
+
+    private val connectHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            try {
+                val target = param.args.getOrNull(0) as? SocketAddress ?: return
+                val requestedPort = (param.args.getOrNull(1) as? Int)
+                    ?: (target as? InetSocketAddress)?.port
+                    ?: return
+                val rewritten = rewriteConnectTarget(target, requestedPort) ?: return
+                param.args[0] = rewritten
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "PrivateServerRedirect: Socket.connect hook failed: ${failureText(t)}", t)
+            }
         }
     }
 
@@ -293,6 +374,11 @@ object PrivateServerRedirect {
      * Returns a replacement [SocketAddress] when [requestedPort] is 443, the target is the private
      * server address, and the server listens on another port. The [InetAddress] instance is reused,
      * so its googleapis hostname (and therefore SNI) survives the rewrite.
+     *
+     * This is the path the framework `okhttp` takes for Firebase Auth: it resolves through our DNS
+     * hook, builds `new InetSocketAddress(redirectedAddress, 443)` and calls
+     * `Socket.connect(SocketAddress, timeout)` on a plain `java.net.Socket` before layering
+     * `SSLSocket` on top.
      */
     private fun rewriteConnectTarget(target: SocketAddress, requestedPort: Int): SocketAddress? {
         if (!active.get()) return null
@@ -320,7 +406,9 @@ object PrivateServerRedirect {
             logErrorOnce("port:${inet.hostString}", "cannot rewrite the connect target ${inet.hostString}", t)
             return null
         }
-        logRedirectOnce(normalizeHost(inet.hostString), "port")
+        // Log every rewrite (not once per host): this is the line that proves the port layer fired.
+        val host = if (targetAddress != null) targetAddress.hostName else inet.hostString
+        Log.i(TAG, "PrivateServerRedirect: port rewrite $host:$requestedPort -> $serverHost:$targetPort")
         return rewritten
     }
 
@@ -336,6 +424,7 @@ object PrivateServerRedirect {
         }
         val chainArray = Array<X509Certificate>::class.java
         var hooked = 0
+        val signatures = ArrayList<String>()
         for (method in clazz.declaredMethods) {
             val name = method.name
             if (name != "checkServerTrusted" && name != "checkTrusted") continue
@@ -346,16 +435,17 @@ object PrivateServerRedirect {
             if (name == "checkTrusted" && parameterTypes.lastOrNull() == Boolean::class.javaPrimitiveType) {
                 continue
             }
-            try {
-                XposedBridge.hookMethod(method, trustHook)
+            if (hookMethod(method, trustHook)) {
                 hooked++
-            }
-            catch (t: Throwable) {
-                Log.w(TAG, "PrivateServerRedirect: cannot hook TrustManagerImpl.$name", t)
+                signatures.add(methodDescription(method))
             }
         }
         if (hooked > 0) {
-            Log.i(TAG, "PrivateServerRedirect: hooked $hooked TrustManagerImpl.checkServerTrusted method(s)")
+            Log.i(
+                TAG,
+                "PrivateServerRedirect: hooked $hooked TrustManagerImpl method(s): " +
+                        signatures.joinToString(", ")
+            )
         }
         else {
             Log.w(TAG, "PrivateServerRedirect: no TrustManagerImpl.checkServerTrusted method was hooked")
@@ -395,7 +485,12 @@ object PrivateServerRedirect {
                     return
                 }
                 param.setResult(resultFor(method, chain))
-                logTrustFallbackOnce(host ?: "<unknown>", chain.size)
+                // Log every fallback (not once per host): this proves the private-server CA was used.
+                Log.i(
+                    TAG,
+                    "PrivateServerRedirect: trust fallback accepted ${chain.size} certificate(s) " +
+                            "for ${host ?: "<unknown>"} using the private server CA"
+                )
                 return
             }
             // The original accepted the chain: skip the framework re-invocation.
@@ -567,21 +662,37 @@ object PrivateServerRedirect {
         return host
     }
 
-    private fun logRedirectOnce(host: String, kind: String) {
-        if (!loggedRedirects.add("$kind:$host")) return
-        Log.i(
-            TAG,
-            "PrivateServerRedirect: $kind redirect $host -> $serverHost:$serverPort"
-        )
+    private fun findClass(name: String, classLoader: ClassLoader): Class<*>? {
+        return try {
+            XposedHelpers.findClass(name, classLoader)
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerRedirect: cannot load $name: ${failureText(t)}", t)
+            null
+        }
     }
 
-    private fun logTrustFallbackOnce(host: String, chainSize: Int) {
-        if (!loggedTrustFallbacks.add(host)) return
-        Log.i(
-            TAG,
-            "PrivateServerRedirect: trust fallback accepted $chainSize certificate(s) for $host " +
-                    "using the private server CA"
-        )
+    private fun hookMethod(method: Method, hook: XC_MethodHook): Boolean {
+        val description = methodDescription(method)
+        return try {
+            XposedBridge.hookMethod(method, hook)
+            Log.i(TAG, "PrivateServerRedirect: hooked $description")
+            true
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerRedirect: cannot hook $description: ${failureText(t)}", t)
+            false
+        }
+    }
+
+    private fun methodDescription(method: Method): String {
+        val parameters = method.parameterTypes.joinToString(",") { it.name }
+        return "${method.declaringClass.name}#${method.name}($parameters)"
+    }
+
+    private fun failureText(t: Throwable): String {
+        val message = t.message
+        return if (message.isNullOrBlank()) t.javaClass.name else "${t.javaClass.name}: $message"
     }
 
     private fun logTrustFailureOnce(host: String, failure: Throwable) {
