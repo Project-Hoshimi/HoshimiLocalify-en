@@ -4,6 +4,7 @@ import android.util.Log
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.io.FileDescriptor
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.net.InetAddress
@@ -19,6 +20,7 @@ import java.security.cert.TrustAnchor
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLSession
@@ -43,8 +45,11 @@ import javax.net.ssl.X509TrustManager
  *     *googleapis* hostname (via `InetAddress.getByAddress(hostname, ...)`), so TLS SNI and
  *     Conscrypt's hostname verification still see the certificate's SAN.
  *  2. [hookSocketConnect] rewrites `<server address>:443` to `<server address>:<server port>` at
- *     `java.net.Socket.connect`. The native `connect` hook does the same for libc sockets, but it
- *     is only installed in preserve-host mode (see `PrivateServer.cpp`), so Java sockets need their
+ *     `java.net.Socket.connect`, at `java.net.AbstractPlainSocketImpl.connect`, and at every
+ *     `libcore.io.IoBridge`/`Linux`/`ForwardingOs` `connect`/`connectErrno` overload. The last layer
+ *     is the one the framework `okhttp` path really lands in and it sees dual-stack
+ *     (IPv4-mapped IPv6) addresses; the native `connect` hook does the same for libc sockets but is
+ *     only installed in preserve-host mode (see `PrivateServer.cpp`), so Java sockets need their
  *     own rewrite to be independent of the native mode.
  *  3. [hookPlatformTrustManager] lets Conscrypt accept the private server's chain. Adding the CA to
  *     `getAcceptedIssuers()` (see [PrivateServerTrust]) does *not* make `checkServerTrusted` pass -
@@ -74,8 +79,12 @@ object PrivateServerRedirect {
     private const val DEFAULT_HTTPS_PORT = 443
     private const val DEFAULT_HTTP_PORT = 80
 
+    /** Upper bound for the "saw host:443 but did not rewrite it" diagnostic. */
+    private const val MAX_CONNECT_MISS_LOGS = 10
+
     private val installed = AtomicBoolean(false)
     private val active = AtomicBoolean(false)
+    private val connectMissLogCount = AtomicInteger()
 
     private val redirectHosts: Set<String> = BASE_REDIRECT_HOSTS
 
@@ -115,7 +124,7 @@ object PrivateServerRedirect {
             return
         }
         hookNameResolution(classLoader)
-        hookSocketConnect()
+        hookSocketConnect(classLoader)
         hookPlatformTrustManager(classLoader)
     }
 
@@ -305,8 +314,12 @@ object PrivateServerRedirect {
 
     // ---- port ----------------------------------------------------------------------------
 
-    private fun hookSocketConnect() {
+    private fun hookSocketConnect(classLoader: ClassLoader) {
         hookConnectOn(Socket::class.java)
+        // On Android `Socket.connect` lands in `getImpl().connect(...)`, i.e. the package-private
+        // `AbstractPlainSocketImpl.connect(SocketAddress, int)`. Hooking the impl covers Socket
+        // subclasses whose `connect` never calls `super` (and okhttp's own socket factory output).
+        hookConnectOn(loadClass("java.net.AbstractPlainSocketImpl", classLoader))
         // `HttpsURLConnection` (what Firebase Auth uses) wraps a plain `java.net.Socket`, which is
         // covered above. Conscrypt's SSLSocket implementations override `connect` and call their own
         // native connect, so hook them too when the build exposes them.
@@ -315,17 +328,27 @@ object PrivateServerRedirect {
             "com.android.org.conscrypt.ConscryptEngineSocket",
             "com.android.org.conscrypt.OpenSSLSocketImpl",
         )) {
-            val clazz = try {
-                Class.forName(name)
-            }
-            catch (_: Throwable) {
-                null
-            } ?: continue
-            hookConnectOn(clazz)
+            hookConnectOn(loadClass(name, classLoader))
         }
+        // The layer that actually connects: `PlainSocketImpl` -> `Net.connect` ->
+        // `IoBridge.connect(FileDescriptor, InetAddress, int)`. okhttp/Firebase reach these without
+        // passing through a hookable Socket subclass, and this is also where dual-stack
+        // (IPv4-mapped IPv6) addresses show up, so all three Os flavours are hooked.
+        hookLibcoreConnect(classLoader, "libcore.io.IoBridge")
+        hookLibcoreConnect(classLoader, "libcore.io.Linux")
+        hookLibcoreConnect(classLoader, "libcore.io.ForwardingOs")
     }
 
-    private fun hookConnectOn(clazz: Class<*>) {
+    private fun loadClass(name: String, classLoader: ClassLoader): Class<*>? =
+        try {
+            Class.forName(name, false, classLoader)
+        }
+        catch (_: Throwable) {
+            null
+        }
+
+    private fun hookConnectOn(clazz: Class<*>?) {
+        if (clazz == null) return
         var hooked = 0
         for (method in connectMethods(clazz)) {
             if (hookMethod(method, connectHook)) {
@@ -334,6 +357,9 @@ object PrivateServerRedirect {
         }
         if (hooked == 0) {
             Log.i(TAG, "PrivateServerRedirect: ${clazz.name} declares no hookable connect(SocketAddress[, int])")
+        }
+        else {
+            Log.i(TAG, "PrivateServerRedirect: port hook covered $clazz.name ($hooked method(s))")
         }
     }
 
@@ -354,6 +380,38 @@ object PrivateServerRedirect {
         return methods
     }
 
+    /**
+     * Hooks `connect`/`connectErrno` on a `libcore.io` class. Every overload whose first three
+     * parameters are `(FileDescriptor, InetAddress, int)` is covered, which includes the
+     * `timeoutMs` variant and the `connectErrno` helper that the exception-translating wrappers use.
+     */
+    private fun hookLibcoreConnect(classLoader: ClassLoader, className: String) {
+        val clazz = findClass(className, classLoader) ?: return
+        var hooked = 0
+        for (method in clazz.declaredMethods) {
+            if (method.name != "connect" && method.name != "connectErrno") continue
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.size < 3 || parameterTypes.size > 4) continue
+            if (parameterTypes[0] != FileDescriptor::class.java) continue
+            if (parameterTypes[1] != InetAddress::class.java) continue
+            if (parameterTypes[2] != Int::class.javaPrimitiveType) continue
+            if (parameterTypes.size == 4 && parameterTypes[3] != Int::class.javaPrimitiveType) continue
+            if (hookMethod(method, libcoreConnectHook)) {
+                hooked++
+            }
+        }
+        if (hooked > 0) {
+            Log.i(TAG, "PrivateServerRedirect: hooked $hooked $className connect method(s)")
+        }
+        else {
+            Log.w(
+                TAG,
+                "PrivateServerRedirect: $className declares no hookable " +
+                        "connect(FileDescriptor,InetAddress,int[,int])"
+            )
+        }
+    }
+
     private val connectHook = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
             try {
@@ -370,6 +428,21 @@ object PrivateServerRedirect {
         }
     }
 
+    /** `libcore.io` variants carry the port as a plain int argument (index 2), no SocketAddress. */
+    private val libcoreConnectHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            try {
+                val address = param.args.getOrNull(1) as? InetAddress ?: return
+                val requestedPort = param.args.getOrNull(2) as? Int ?: return
+                val targetPort = rewriteServerPort(address, requestedPort, "libcore") ?: return
+                param.args[2] = targetPort
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "PrivateServerRedirect: libcore connect hook failed: ${failureText(t)}", t)
+            }
+        }
+    }
+
     /**
      * Returns a replacement [SocketAddress] when [requestedPort] is 443, the target is the private
      * server address, and the server listens on another port. The [InetAddress] instance is reused,
@@ -381,35 +454,92 @@ object PrivateServerRedirect {
      * `SSLSocket` on top.
      */
     private fun rewriteConnectTarget(target: SocketAddress, requestedPort: Int): SocketAddress? {
-        if (!active.get()) return null
-        if (requestedPort != DEFAULT_HTTPS_PORT) return null
+        val inet = target as? InetSocketAddress ?: return null
+        if (!active.get() || requestedPort != DEFAULT_HTTPS_PORT) return null
         val targetPort = serverPort
         if (targetPort <= 0 || targetPort == DEFAULT_HTTPS_PORT) return null
-        val inet = target as? InetSocketAddress ?: return null
 
         val targetAddress = inet.address
-        val matches = if (targetAddress != null) {
-            val server = serverAddress() ?: return null
-            targetAddress == server
+        if (targetAddress != null) {
+            // Address comparison is byte based: Java sockets may hold the IPv4-mapped IPv6 form
+            // (::ffff:a.b.c.d) of the same server while our redirect supplies an Inet4Address.
+            val port = rewriteServerPort(targetAddress, requestedPort, "Socket.connect") ?: return null
+            return try {
+                InetSocketAddress(targetAddress, port)
+            }
+            catch (t: Throwable) {
+                logErrorOnce("port:${targetAddress.hostAddress}", "cannot rewrite the connect target ${targetAddress.hostAddress}", t)
+                null
+            }
         }
-        else {
-            // Unresolved InetSocketAddress: the hostname identifies the request.
-            normalizeHost(inet.hostString) in redirectHosts
-        }
-        if (!matches) return null
 
-        val rewritten = try {
-            if (targetAddress != null) InetSocketAddress(targetAddress, targetPort)
-            else InetSocketAddress(inet.hostString, targetPort)
-        }
-        catch (t: Throwable) {
-            logErrorOnce("port:${inet.hostString}", "cannot rewrite the connect target ${inet.hostString}", t)
+        // Unresolved InetSocketAddress: the hostname identifies the request. Match the redirected
+        // hosts and the server's own literal (which the DNS hook also returns for them).
+        val host = normalizeHost(inet.hostString)
+        if (host !in redirectHosts && host != normalizeHost(serverHost)) return null
+        Log.i(TAG, "PrivateServerRedirect: port rewrite[Socket.connect,unresolved] $host:$requestedPort -> $serverHost:$targetPort")
+        return InetSocketAddress(inet.hostString, targetPort)
+    }
+
+    /**
+     * Port layer shared by the `Socket.connect` and `libcore.io` hooks: returns the private server
+     * port when [address] designates the server and [requestedPort] is 443, else null.
+     */
+    private fun rewriteServerPort(address: InetAddress, requestedPort: Int, layer: String): Int? {
+        if (!active.get() || requestedPort != DEFAULT_HTTPS_PORT) return null
+        val targetPort = serverPort
+        if (targetPort <= 0 || targetPort == DEFAULT_HTTPS_PORT) return null
+        if (!isServerAddress(address)) {
+            logConnectMiss(layer, address, requestedPort)
             return null
         }
         // Log every rewrite (not once per host): this is the line that proves the port layer fired.
-        val host = if (targetAddress != null) targetAddress.hostName else inet.hostString
-        Log.i(TAG, "PrivateServerRedirect: port rewrite $host:$requestedPort -> $serverHost:$targetPort")
-        return rewritten
+        // hostAddress (not hostName) on purpose: hostName can trigger a reverse lookup in a hot path.
+        Log.i(TAG, "PrivateServerRedirect: port rewrite[$layer] ${address.hostAddress}:$requestedPort -> $serverHost:$targetPort")
+        return targetPort
+    }
+
+    /**
+     * True when [address] designates the private server, either as a plain IPv4 address or as an
+     * IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), which is the form dual-stack Java sockets carry.
+     */
+    private fun isServerAddress(address: InetAddress): Boolean {
+        val server = serverAddress() ?: return false
+        val target = address.address
+        val expected = server.address
+        if (target.size == expected.size && target.contentEquals(expected)) return true
+        return when {
+            target.size == 16 && expected.size == 4 -> isV4MappedOf(target, expected)
+            target.size == 4 && expected.size == 16 -> isV4MappedOf(expected, target)
+            else -> false
+        }
+    }
+
+    /** `mapped` is a 16-byte `::ffff:a.b.c.d` form of the 4-byte [v4] address. */
+    private fun isV4MappedOf(mapped: ByteArray, v4: ByteArray): Boolean {
+        if (mapped.size != 16 || v4.size != 4) return false
+        for (index in 0 until 10) {
+            if (mapped[index].toInt() != 0) return false
+        }
+        if ((mapped[10].toInt() and 0xff) != 0xff || (mapped[11].toInt() and 0xff) != 0xff) return false
+        for (index in 0 until 4) {
+            if (mapped[12 + index] != v4[index]) return false
+        }
+        return true
+    }
+
+    /**
+     * Rate-limited diagnostic: shows which `host:443` targets the port hooks saw but did not
+     * rewrite. Without it a silent non-match looks exactly like a hook that never ran.
+     */
+    private fun logConnectMiss(layer: String, address: InetAddress, port: Int) {
+        val count = connectMissLogCount.incrementAndGet()
+        if (count > MAX_CONNECT_MISS_LOGS) return
+        Log.i(
+            TAG,
+            "PrivateServerRedirect: port skip[$layer] ${address.hostAddress}:$port " +
+                    "does not match $serverHost:$serverPort"
+        )
     }
 
     // ---- TLS -----------------------------------------------------------------------------
