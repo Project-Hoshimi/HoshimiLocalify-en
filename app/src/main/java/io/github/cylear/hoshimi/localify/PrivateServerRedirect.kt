@@ -51,11 +51,27 @@ import javax.net.ssl.X509TrustManager
  *     (IPv4-mapped IPv6) addresses; the native `connect` hook does the same for libc sockets but is
  *     only installed in preserve-host mode (see `PrivateServer.cpp`), so Java sockets need their
  *     own rewrite to be independent of the native mode.
- *  3. [hookPlatformTrustManager] lets Conscrypt accept the private server's chain. Adding the CA to
- *     `getAcceptedIssuers()` (see [PrivateServerTrust]) does *not* make `checkServerTrusted` pass -
- *     that method only consults the system trust store. When the real implementation throws and the
- *     chain validates against the configured private-server CA, the call succeeds; anything that
- *     does not validate is rethrown unchanged. There is no accept-all path.
+ *  3. [hookNetworkSecurityConfigAnchors] injects the private server CA as a trust anchor exactly
+ *     where the platform looks anchors up. On Android 7+ the default chain is
+ *     `RootTrustManager` -> `NetworkSecurityTrustManager` -> `com.android.org.conscrypt
+ *     .TrustManagerImpl` built with a `TrustedCertificateStoreAdapter` over the app's
+ *     `NetworkSecurityConfig`. That adapter forwards to
+ *     `NetworkSecurityConfig.findTrustAnchorBySubjectAndPublicKey`,
+ *     `findTrustAnchorByIssuerAndSignature` and `findAllCertificatesByIssuerAndSignature`; the
+ *     server sends only its leaf certificate, so without the injected anchor the platform fails
+ *     with `CertPathValidatorException: Trust anchor for certification path not found`. The
+ *     injected anchor is always the configured CA itself and only matches a certificate that CA
+ *     issued (subject+public key, or issuer+signature), so nothing else becomes trusted.
+ *  4. [hookTrustManagerFallbacks] is the second line of defence: `checkServerTrusted` on
+ *     `android.security.net.config.RootTrustManager` and
+ *     `android.security.net.config.NetworkSecurityTrustManager`, on the framework
+ *     `com.android.org.conscrypt.TrustManagerImpl` and on the GMS-relocated
+ *     `com.google.android.gms.org.conscrypt.TrustManagerImpl`. When the original throws a
+ *     certificate error, the chain is validated against a trust manager containing only the
+ *     configured CA and the call succeeds only if that validation passes; otherwise the platform
+ *     verdict is rethrown unchanged. There is no accept-all path. This matters because
+ *     `NetworkSecurityTrustManager` calls `TrustManagerImpl.getTrustedChainForServer`, which the
+ *     plain `checkServerTrusted` hook never sees.
  *
  * Everything is inert until [onConfigChanged] delivers an enabled private-server configuration with
  * a usable URL; [PrivateServerTrust] owns that configuration, this object only mirrors it.
@@ -81,6 +97,15 @@ object PrivateServerRedirect {
 
     /** Upper bound for the "saw host:443 but did not rewrite it" diagnostic. */
     private const val MAX_CONNECT_MISS_LOGS = 10
+
+    /** GMS ships its own relocated Conscrypt copy; hooked when it is already loadable. */
+    private const val GMS_TRUST_MANAGER_CLASS = "com.google.android.gms.org.conscrypt.TrustManagerImpl"
+
+    /** Trust-hook entry logging only fires for certificates named after these suffixes. */
+    private val RELEVANT_CERT_SUFFIXES = listOf("googleapis.com", "game-idolypride.jp", "octo-cloud.com")
+
+    /** Extract the `CN=` part of a `X500Principal` name without pulling in `javax.naming`. */
+    private val subjectCnRegex = Regex("(?:^|,)\\s*CN=([^,]+)")
 
     private val installed = AtomicBoolean(false)
     private val active = AtomicBoolean(false)
@@ -108,9 +133,23 @@ object PrivateServerRedirect {
     private val loggedTrustFailures = ConcurrentHashMap.newKeySet<String>()
     private val loggedErrors = ConcurrentHashMap.newKeySet<String>()
 
+    /** CA certificates of the private-server configuration, used for trust-anchor injection. */
+    @Volatile
+    private var devCaCerts: List<X509Certificate> = emptyList()
+
+    /** Classloader of the patched app, kept so the GMS Conscrypt copy can be probed on config updates. */
+    @Volatile
+    private var appClassLoader: ClassLoader? = null
+
+    private val gmsTrustHooksInstalled = AtomicBoolean(false)
+    private val gmsProbeMissLogged = AtomicBoolean(false)
+
     /** Runtime class of `InetAddress[]`, shared by every DNS hook that returns an address list. */
     private val inetAddressArrayClass: Class<*> =
         java.lang.reflect.Array.newInstance(InetAddress::class.java, 0).javaClass
+
+    /** Runtime class of `X509Certificate[]`, shared by every TLS chain hook. */
+    private val certificateArrayClass: Class<*> = Array<X509Certificate>::class.java
 
     // ---- installation --------------------------------------------------------------------
 
@@ -125,7 +164,10 @@ object PrivateServerRedirect {
         }
         hookNameResolution(classLoader)
         hookSocketConnect(classLoader)
+        appClassLoader = classLoader
         hookPlatformTrustManager(classLoader)
+        hookNetworkSecurityConfigAnchors(classLoader)
+        hookTrustManagerFallbacks(classLoader)
     }
 
     // ---- configuration -------------------------------------------------------------------
@@ -154,7 +196,10 @@ object PrivateServerRedirect {
             serverAddress.set(null)
         }
         caTrustManager = PrivateCaTrustManager(caCerts)
+        devCaCerts = caCerts
         active.set(true)
+        // A config update is also a cheap moment to probe for the GMS-relocated Conscrypt copy.
+        tryHookGmsTrustManager()
         if (changed) {
             Log.i(
                 TAG,
@@ -173,6 +218,7 @@ object PrivateServerRedirect {
         serverHost = ""
         serverPort = 0
         caTrustManager = null
+        devCaCerts = emptyList()
         serverAddress.set(null)
     }
 
@@ -545,14 +591,22 @@ object PrivateServerRedirect {
     // ---- TLS -----------------------------------------------------------------------------
 
     private fun hookPlatformTrustManager(classLoader: ClassLoader) {
-        val clazz = try {
-            XposedHelpers.findClass("com.android.org.conscrypt.TrustManagerImpl", classLoader)
-        }
-        catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerRedirect: com.android.org.conscrypt.TrustManagerImpl not found", t)
+        val clazz = findClass("com.android.org.conscrypt.TrustManagerImpl", classLoader)
+        if (clazz == null) {
+            Log.w(TAG, "PrivateServerRedirect: com.android.org.conscrypt.TrustManagerImpl not found")
             return
         }
-        val chainArray = Array<X509Certificate>::class.java
+        hookConscryptTrustManager(clazz)
+    }
+
+    /**
+     * Hooks `checkServerTrusted`/`checkTrusted(chain, authType, ...)` on a Conscrypt trust manager
+     * implementation. Used for the framework copy and the GMS-relocated copy. Conscrypt's
+     * `getTrustedChainForServer` is not hooked here because the trust check that fails on device
+     * never reaches `checkServerTrusted`: its caller (`NetworkSecurityTrustManager`, see
+     * [hookTrustManagerClass]) is hooked instead.
+     */
+    private fun hookConscryptTrustManager(clazz: Class<*>): Int {
         var hooked = 0
         val signatures = ArrayList<String>()
         for (method in clazz.declaredMethods) {
@@ -560,7 +614,7 @@ object PrivateServerRedirect {
             if (name != "checkServerTrusted" && name != "checkTrusted") continue
             val parameterTypes = method.parameterTypes
             if (parameterTypes.size < 2) continue
-            if (parameterTypes[0] != chainArray || parameterTypes[1] != String::class.java) continue
+            if (parameterTypes[0] != certificateArrayClass || parameterTypes[1] != String::class.java) continue
             // checkTrusted(..., boolean clientAuth): only the server-auth path is interesting.
             if (name == "checkTrusted" && parameterTypes.lastOrNull() == Boolean::class.javaPrimitiveType) {
                 continue
@@ -573,17 +627,265 @@ object PrivateServerRedirect {
         if (hooked > 0) {
             Log.i(
                 TAG,
-                "PrivateServerRedirect: hooked $hooked TrustManagerImpl method(s): " +
+                "PrivateServerRedirect: hooked $hooked ${clazz.name} method(s): " +
                         signatures.joinToString(", ")
             )
         }
         else {
-            Log.w(TAG, "PrivateServerRedirect: no TrustManagerImpl.checkServerTrusted method was hooked")
+            Log.w(TAG, "PrivateServerRedirect: no ${clazz.name}.checkServerTrusted method was hooked")
+        }
+        return hooked
+    }
+
+    /**
+     * Hooks the platform trust-anchor lookups. On Android 7+ the default trust manager chain is
+     * `RootTrustManager` -> `NetworkSecurityTrustManager` -> `TrustManagerImpl`, where the last one
+     * is built with a `TrustedCertificateStoreAdapter` over the app's `NetworkSecurityConfig`. That
+     * adapter forwards anchor questions to the three methods hooked here:
+     *
+     *  - `findTrustAnchorBySubjectAndPublicKey`: "is this certificate itself an anchor?" (also used
+     *    by the pin check, which looks up the anchor the chain ended in);
+     *  - `findTrustAnchorByIssuerAndSignature`: "is this certificate issued by an anchor?" (used by
+     *    older Conscrypt copies / `findIssuer`);
+     *  - `findAllCertificatesByIssuerAndSignature`: the same question in list form, which is what
+     *    current Conscrypt's path builder calls through `findAllIssuers`.
+     *
+     * The private server sends only its leaf certificate, so without an injected anchor the platform
+     * fails with `CertPathValidatorException: Trust anchor for certification path not found`.
+     */
+    private fun hookNetworkSecurityConfigAnchors(classLoader: ClassLoader) {
+        val clazz = findClass("android.security.net.config.NetworkSecurityConfig", classLoader)
+        if (clazz == null) {
+            Log.i(TAG, "PrivateServerRedirect: NetworkSecurityConfig is unavailable; trust-anchor injection skipped")
+            return
+        }
+        var bySubject: Method? = null
+        var byIssuer: Method? = null
+        var findAll: Method? = null
+        for (method in clazz.declaredMethods) {
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.size != 1 || parameterTypes[0] != X509Certificate::class.java) continue
+            when (method.name) {
+                "findTrustAnchorBySubjectAndPublicKey" -> bySubject = method
+                "findTrustAnchorByIssuerAndSignature" -> byIssuer = method
+                "findAllCertificatesByIssuerAndSignature" -> findAll = method
+            }
+        }
+        val subjectMethod = bySubject
+        if (subjectMethod != null) {
+            hookMethod(subjectMethod, anchorBySubjectHook)
+        }
+        else {
+            Log.w(TAG, "PrivateServerRedirect: NetworkSecurityConfig.findTrustAnchorBySubjectAndPublicKey not found")
+        }
+        val issuerMethod = byIssuer
+        if (issuerMethod != null) {
+            hookMethod(issuerMethod, anchorByIssuerHook)
+        }
+        else {
+            Log.w(TAG, "PrivateServerRedirect: NetworkSecurityConfig.findTrustAnchorByIssuerAndSignature not found")
+        }
+        val findAllMethod = findAll
+        if (findAllMethod != null && Set::class.java.isAssignableFrom(findAllMethod.returnType)) {
+            hookMethod(findAllMethod, findAllAnchorsHook)
+        }
+        else {
+            Log.w(TAG, "PrivateServerRedirect: NetworkSecurityConfig.findAllCertificatesByIssuerAndSignature not hookable")
+        }
+    }
+
+    /** "Is this certificate itself one of the anchors?" - only an exact dev-CA match is injected. */
+    private val anchorBySubjectHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            logTrustEntry("anchor.subjectAndKey", param)
+        }
+
+        override fun afterHookedMethod(param: MethodHookParam) {
+            try {
+                if (!active.get() || param.hasThrowable()) return
+                if (param.result != null) return
+                val cert = param.args.getOrNull(0) as? X509Certificate ?: return
+                val devCa = devCaCerts.firstOrNull { sameSubjectAndPublicKey(it, cert) } ?: return
+                val anchor = createNetworkSecurityTrustAnchor(param, devCa) ?: return
+                param.setResult(anchor)
+                Log.i(
+                    TAG,
+                    "PrivateServerRedirect: injected trust anchor [subjectAndPublicKey] for " +
+                            "${cert.subjectX500Principal.name} (private server CA)"
+                )
+            }
+            catch (t: Throwable) {
+                logErrorOnce("anchor:subject", "trust anchor injection [subjectAndPublicKey] failed", t)
+            }
+        }
+    }
+
+    /** "Is this certificate issued by one of the anchors?" - the CA must have signed it. */
+    private val anchorByIssuerHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            logTrustEntry("anchor.issuerAndSignature", param)
+        }
+
+        override fun afterHookedMethod(param: MethodHookParam) {
+            try {
+                if (!active.get() || param.hasThrowable()) return
+                if (param.result != null) return
+                val cert = param.args.getOrNull(0) as? X509Certificate ?: return
+                val devCa = devCaCerts.firstOrNull { issuedBy(cert, it) } ?: return
+                val anchor = createNetworkSecurityTrustAnchor(param, devCa) ?: return
+                param.setResult(anchor)
+                Log.i(
+                    TAG,
+                    "PrivateServerRedirect: injected trust anchor [issuerAndSignature] for " +
+                            "${cert.subjectX500Principal.name} (private server CA)"
+                )
+            }
+            catch (t: Throwable) {
+                logErrorOnce("anchor:issuer", "trust anchor injection [issuerAndSignature] failed", t)
+            }
+        }
+    }
+
+    /**
+     * List form of the issuer lookup; this is the one current Conscrypt's path builder really calls.
+     * Existing anchors are preserved, the dev CA is appended only when it actually signed the
+     * certificate.
+     */
+    private val findAllAnchorsHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            logTrustEntry("anchor.findAllByIssuer", param)
+        }
+
+        override fun afterHookedMethod(param: MethodHookParam) {
+            try {
+                if (!active.get() || param.hasThrowable()) return
+                val existing = param.result as? Collection<*>
+                if (existing != null && existing.isNotEmpty()) return
+                val cert = param.args.getOrNull(0) as? X509Certificate ?: return
+                val matching = devCaCerts.filter { issuedBy(cert, it) }
+                if (matching.isEmpty()) return
+                val anchors = LinkedHashSet<X509Certificate>()
+                existing?.forEach { if (it is X509Certificate) anchors.add(it) }
+                anchors.addAll(matching)
+                param.setResult(anchors)
+                Log.i(
+                    TAG,
+                    "PrivateServerRedirect: injected ${matching.size} trust anchor(s) [findAllByIssuer] " +
+                            "for ${cert.subjectX500Principal.name} (private server CA)"
+                )
+            }
+            catch (t: Throwable) {
+                logErrorOnce("anchor:findAll", "trust anchor injection [findAllByIssuer] failed", t)
+            }
+        }
+    }
+
+    /**
+     * Builds `android.security.net.config.TrustAnchor(devCa, overridesPins = false)` reflectively,
+     * because the class is `@hide` and only reachable at runtime. With `overridesPins = false` the
+     * platform still enforces an app's pin set; the injected object only supplies the anchor.
+     */
+    private fun createNetworkSecurityTrustAnchor(param: XC_MethodHook.MethodHookParam, devCa: X509Certificate): Any? {
+        val method = param.method as? Method ?: return null
+        val booleanType: Class<*> = java.lang.Boolean.TYPE
+        return try {
+            val constructor = method.returnType.getDeclaredConstructor(
+                X509Certificate::class.java,
+                booleanType
+            )
+            constructor.isAccessible = true
+            constructor.newInstance(devCa, false)
+        }
+        catch (t: Throwable) {
+            logErrorOnce(
+                "anchor:ctor",
+                "cannot construct an android.security.net.config.TrustAnchor for ${devCa.subjectX500Principal.name}",
+                t
+            )
+            null
+        }
+    }
+
+    /**
+     * Installs the trust fallbacks. `RootTrustManager` is the app-visible default trust manager and
+     * `NetworkSecurityTrustManager` is its delegate based on `NetworkSecurityConfig`; both are hooked
+     * because `NetworkSecurityTrustManager` reaches Conscrypt through `getTrustedChainForServer`,
+     * which bypasses any `TrustManagerImpl.checkServerTrusted` hook.
+     */
+    private fun hookTrustManagerFallbacks(classLoader: ClassLoader) {
+        hookTrustManagerClass("android.security.net.config.RootTrustManager", classLoader)
+        hookTrustManagerClass("android.security.net.config.NetworkSecurityTrustManager", classLoader)
+        tryHookGmsTrustManager()
+    }
+
+    /** Hooks every `checkServerTrusted` overload of a `javax.net.ssl.X509TrustManager`. */
+    private fun hookTrustManagerClass(className: String, classLoader: ClassLoader) {
+        val clazz = loadClassQuietly(className, classLoader)
+        if (clazz == null) {
+            Log.i(TAG, "PrivateServerRedirect: $className not present; trust fallback skipped")
+            return
+        }
+        var hooked = 0
+        for (method in clazz.declaredMethods) {
+            if (method.name != "checkServerTrusted") continue
+            val parameterTypes = method.parameterTypes
+            if (parameterTypes.size < 2) continue
+            if (parameterTypes[0] != certificateArrayClass || parameterTypes[1] != String::class.java) continue
+            if (hookMethod(method, trustHook)) hooked++
+        }
+        Log.i(TAG, "PrivateServerRedirect: hooked $hooked $className.checkServerTrusted overload(s)")
+    }
+
+    /**
+     * Hooks the GMS-relocated Conscrypt copy when it is already loaded in this process. GMS keeps it
+     * in its own classloader, so the app loader, the context loader and the system loader are all
+     * tried; when none of them can load it the probe is skipped (debug log only) and the platform
+     * hooks remain in charge.
+     */
+    private fun tryHookGmsTrustManager() {
+        if (gmsTrustHooksInstalled.get()) return
+        val loaders = ArrayList<ClassLoader>(3)
+        appClassLoader?.let { loaders.add(it) }
+        Thread.currentThread().contextClassLoader?.let { if (it !in loaders) loaders.add(it) }
+        val systemLoader = ClassLoader.getSystemClassLoader()
+        if (systemLoader != null && systemLoader !in loaders) loaders.add(systemLoader)
+        for (loader in loaders) {
+            val clazz = try {
+                Class.forName(GMS_TRUST_MANAGER_CLASS, false, loader)
+            }
+            catch (_: Throwable) {
+                continue
+            }
+            if (hookConscryptTrustManager(clazz) > 0) {
+                gmsTrustHooksInstalled.set(true)
+            }
+            return
+        }
+        if (gmsProbeMissLogged.compareAndSet(false, true)) {
+            Log.d(TAG, "PrivateServerRedirect: $GMS_TRUST_MANAGER_CLASS is not loadable; platform hooks only")
+        }
+    }
+
+    private fun loadClassQuietly(name: String, classLoader: ClassLoader?): Class<*>? {
+        if (classLoader != null) {
+            try {
+                return Class.forName(name, false, classLoader)
+            }
+            catch (_: Throwable) {
+                // fall through to the default loader
+            }
+        }
+        return try {
+            Class.forName(name)
+        }
+        catch (_: Throwable) {
+            null
         }
     }
 
     private val trustHook = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
+            logTrustEntry("checkServerTrusted", param)
             val trustManager = caTrustManager
             if (trustManager == null || !active.get()) return
             val method = param.method as? Method ?: return
@@ -603,6 +905,7 @@ object PrivateServerRedirect {
                 }
                 val host = hostFromArgs(param.args)
                 if (host != null && normalizeHost(host) !in redirectHosts) {
+                    logTrustFailureOnce(host, failure)
                     param.setThrowable(failure)
                     return
                 }
@@ -610,7 +913,7 @@ object PrivateServerRedirect {
                     trustManager.checkServerTrusted(chain.toTypedArray(), param.args[1] as String)
                 }
                 catch (fallbackFailure: Throwable) {
-                    logTrustFailureOnce(host ?: "<unknown>", fallbackFailure)
+                    logTrustFallbackRejectedOnce(host ?: "<unknown>", failure, fallbackFailure)
                     param.setThrowable(failure)
                     return
                 }
@@ -825,13 +1128,123 @@ object PrivateServerRedirect {
         return if (message.isNullOrBlank()) t.javaClass.name else "${t.javaClass.name}: $message"
     }
 
+    /**
+     * Diagnostic: logs every trust-hook entry for a certificate that carries a Firebase/game name in
+     * its CN or SAN list. Chain hooks receive the chain array, anchor hooks the certificate itself.
+     * Runs before any decision, so a device log shows which layer actually fires.
+     */
+    private fun logTrustEntry(label: String, param: XC_MethodHook.MethodHookParam) {
+        try {
+            if (!active.get()) return
+            val first = param.args.getOrNull(0)
+            val cert = when (first) {
+                is X509Certificate -> first
+                is Array<*> -> first.firstOrNull() as? X509Certificate
+                else -> null
+            } ?: return
+            if (!isRelevantCertificate(cert)) return
+            val method = param.method as? Method
+            val description = if (method != null) methodDescription(method) else label
+            Log.i(
+                TAG,
+                "PrivateServerRedirect: trust entry[$label] $description " +
+                        "leaf=${cert.subjectX500Principal.name}"
+            )
+        }
+        catch (t: Throwable) {
+            logErrorOnce("trust-entry", "trust entry logging failed", t)
+        }
+    }
+
+    /** True when the certificate is named after a Firebase/game host in its CN or dNSName SANs. */
+    private fun isRelevantCertificate(cert: X509Certificate): Boolean {
+        return certificateNames(cert).any { name ->
+            val normalized = name.trim().lowercase().removePrefix("*.")
+            RELEVANT_CERT_SUFFIXES.any { suffix ->
+                normalized == suffix || normalized.endsWith(".$suffix")
+            }
+        }
+    }
+
+    /** CN plus every dNSName SAN of a certificate; parsing failures are simply skipped. */
+    private fun certificateNames(cert: X509Certificate): List<String> {
+        val names = ArrayList<String>(4)
+        try {
+            subjectCnRegex.find(cert.subjectX500Principal.name)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { names.add(it) }
+        }
+        catch (_: Throwable) {
+            // best-effort diagnostics only
+        }
+        try {
+            cert.subjectAlternativeNames?.forEach { entry ->
+                if (entry.size >= 2 && (entry[0] as? Int) == 2) {
+                    (entry[1] as? String)?.let { names.add(it) }
+                }
+            }
+        }
+        catch (_: Throwable) {
+            // best-effort diagnostics only
+        }
+        return names
+    }
+
+    /** Anchor lookup by certificate identity: same subject and same public key. */
+    private fun sameSubjectAndPublicKey(ca: X509Certificate, cert: X509Certificate): Boolean {
+        return try {
+            ca.subjectX500Principal == cert.subjectX500Principal && ca.publicKey == cert.publicKey
+        }
+        catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** Anchor lookup by issuer: the CA's subject matches and its key verifies the certificate. */
+    private fun issuedBy(cert: X509Certificate, ca: X509Certificate): Boolean {
+        return try {
+            if (cert.issuerX500Principal != ca.subjectX500Principal) {
+                false
+            }
+            else {
+                cert.verify(ca.publicKey)
+                true
+            }
+        }
+        catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** Class name, message and the first 8 stack frames - enough to identify the failing layer. */
+    private fun describeThrowable(t: Throwable): String {
+        val message = t.message
+        val header = if (message.isNullOrBlank()) t.javaClass.name else "${t.javaClass.name}: $message"
+        val frames = t.stackTrace
+        if (frames.isEmpty()) return header
+        return header + frames.take(8).joinToString(separator = "") { "\n    at $it" }
+    }
+
     private fun logTrustFailureOnce(host: String, failure: Throwable) {
         if (!loggedTrustFailures.add(host)) return
         Log.w(
             TAG,
+            "PrivateServerRedirect: trust rethrow for $host: ${describeThrowable(failure)}"
+        )
+    }
+
+    /** The private-server CA rejected the chain as well: the app keeps seeing the platform verdict. */
+    private fun logTrustFallbackRejectedOnce(host: String, platformFailure: Throwable, fallbackFailure: Throwable) {
+        if (!loggedTrustFailures.add(host)) return
+        Log.w(
+            TAG,
             "PrivateServerRedirect: trust fallback rejected the chain for $host; " +
-                    "rethrowing the platform verdict",
-            failure
+                    "rethrowing the platform verdict\n" +
+                    "  platform: ${describeThrowable(platformFailure)}\n" +
+                    "  fallback: ${describeThrowable(fallbackFailure)}"
         )
     }
 
