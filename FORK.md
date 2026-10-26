@@ -66,22 +66,19 @@ Settings (off by default):
 | Setting | Meaning |
 |---|---|
 | Enable private server | Master switch; hooks are only installed when on |
-| Server URL | Scheme + host + port, e.g. `https://sumire.lan:8443`, no trailing slash |
+| Server URL | `https://<server IPv4>:<port>`, e.g. `https://192.168.0.67:8443` |
 | Server CA PEM | PEM of the private server's CA (one or more certificates) |
 
-When enabled, the mod:
+When enabled, preserve-host mode is used whenever the Server URL host is an IPv4 address.
 
-1. rewrites `Solis.Common.Network.Api.GetHost()` to the configured URL (gRPC API);
-2. prepends the configured CA to `Api.GetSSLRootCertificates()` so YAHA/rustls trusts it;
-3. rewrites the scheme+authority of `OctoSettings.url` (asset catalog) to the configured URL;
-4. (Phase 2, rootless) rewrites `UnityWebRequest` URLs for the game/Octo hosts and validates
-   the server certificate against the configured CA;
-5. redirects the **Java** Firebase Auth traffic (`identitytoolkit.googleapis.com`,
-   `securetoken.googleapis.com`, `www.googleapis.com`): `InetAddress` lookups return the
-   private server's address while keeping the googleapis hostname (so SNI/hostname checks
-   still match the server certificate), `Socket.connect` rewrites `:443` to the server port,
-   and `TrustManagerImpl.checkServerTrusted` falls back to the configured CA only for those
-   hosts.
+How it works (preserve-host mode):
+
+- The game keeps its real hostnames (`api.game-idolypride.jp`, `climaster.game-idolypride.jp`, `api.octo-cloud.com`), so TLS SNI and the certificate CN still match the server cert (CN=api.game-idolypride.jp). Unity's TLS (UnityWebRequest) checks the CN only, not IP SANs, which is why URLs are not rewritten.
+- Native hooks in `PrivateServer.cpp`: `getaddrinfo` resolves exactly those hosts (exact match; Firebase-unrelated Google hosts, `id.qseed.jp` and the CloudFront CDN are untouched) to the configured server address. `connect` rewrites `<server address>:443` to the configured port, because Rust's resolver (gRPC/YAHA) discards the resolved port and uses 443. The `GetHost` and `OctoSettings.url` overrides are disabled in this mode.
+- gRPC trust: the configured CA is prepended to `Api.GetSSLRootCertificates()`.
+- UnityWebRequest trust (rootless): libunity loads its root list over JNI (KeyStore "AndroidCAStore" → TrustManagerFactory → `X509TrustManager.getAcceptedIssuers()` → `getEncoded`). `PrivateServerTrust.kt` hooks `getAcceptedIssuers` and appends the configured CA (seen in logs as "augmented 143 -> 144"). It never changes `checkServerTrusted` for these hosts. Side effect: the extra issuer is visible to any code in the game process that lists accepted issuers.
+- CA cache: the CA is cached at `files/hoshimi-private-server-ca.pem` in the game's data, with an "enabled" marker, so launches from the home screen work. A cache is trusted only if it is marked enabled and is less than 30 days old. It is deleted as soon as a disabled or blank config reaches the game. Known gap: the first home-screen launch right after you turn the feature off can still trust the old CA until the config arrives. It only adds an issuer; it never blocks official servers.
+- The native `CertificateHandler` attach is kept as a fallback, but on 6.0.3 the surface is incomplete ("CertificateHandler surface ctor=yes create=no attach=none"), so it isn't used.
 
 ### Java-side (Firebase Auth) redirect
 
@@ -95,37 +92,21 @@ configured private-server CA, and otherwise rethrows the platform verdict. Hosts
 
 ## Private-server setup for players
 
-1. Install this fork's APK (same package as the `-en` build, so uninstall or upgrade it,
-   not both).
-2. Enable the module for `game.qualiarts.idolypride` in LSPosed.
-3. Open the mod app, go to the **Private server** tab.
-4. **Server URL**: scheme, host and port with no trailing slash, e.g.
-   `https://sumire.lan:8443`. The host must be one of the DNS names or IPs in the
-   server certificate (the SANs in `sumire-sr/tls/api.ext`).
-5. **Server CA PEM**: paste the whole contents of `sumire-sr/tls/ca.crt`, including the
-   `BEGIN`/`END` lines. One or more certificates are accepted.
-6. Turn the switch on, force-stop the game, and launch it **from the mod app** so the
-   config reaches the game process. Launching from the home screen still works through
-   the fallback config request in most cases.
-7. Server side: run sumire-sr with `TLS=1 HTTP2=1 PORT=8443
-   PUBLIC_BASE_URL=https://sumire.lan:8443`, or master downloads will point at the
-   official host.
-
-Leave the switch off for the official servers: with it off no hooks are installed and the
-game behaves exactly like the `-en` build. Only point the mod at a server you control —
-the CA you paste is trusted for every request the redirected hosts make.
-
-The Frida redirect in `sumire-sr/frida/` is the fallback path for rooted devices without
-the mod; it is documented in `sumire-sr/docs/CLIENT_SETUP.md`.
+1. Rooted with LSPosed: install this APK and enable it for `game.qualiarts.idolypride`. No root: patch the game with LSPatch and embed the module, e.g. `java -jar lspatch.jar <game>.apk -m app-full-debug.apk -l 2 -o out`, then install the patched game and this APK (the module app). The signatures differ from the stock game and the `-en` module, so uninstall those first; that deletes their local data.
+2. In the mod app's Private server page, set **Server URL** to `https://<server IPv4>:<port>`, e.g. `https://192.168.0.67:8443`. It must be an IPv4 address to get preserve-host mode. The phone must be able to reach it directly (LAN); no adb tunnel is needed.
+3. **Server CA PEM**: the whole of `sumire-sr/tls/ca.crt`.
+4. Turn it on, force-stop the game, and launch from the mod app (the config travels in the `iprData` extra). Home-screen launches then work through the cached CA.
+5. Server side: run sumire-sr with `TLS=1 HTTP2=1 PORT=8443` and **leave `PUBLIC_BASE_URL` unset** (default `https://api.game-idolypride.jp`), so master download URLs keep the game hostname. Setting it to an IP causes "Curl error 60 … Common Name does not match".
+6. Switch off = official servers: no redirect hooks are installed, and the cached CA is deleted.
 
 ## Status
 
 | Piece | State |
 |---|---|
-| Config fields, settings page (EN/KO) | done, builds |
-| `Api.GetHost` / `Api.GetSSLRootCertificates` / `OctoSettings.url` hooks | done, builds |
-| `UnityWebRequest` URL rewrite + `CertificateHandler` pin | done, builds, not yet verified on a device |
-| Firebase Auth redirect (native hosts + Java DNS/port/TLS) | done, builds, not yet verified on a device |
-| sumire-sr `PUBLIC_BASE_URL` | done, `npm run typecheck` clean |
-| on-device E2E, LSPatch | blocked: no test device here |
+| Redirect (gRPC, master downloads, Octo) with the system CA via Magisk | verified on the Pixel 6 (rooted, LSPosed), 6.0.3 |
+| Without the system CA (Java trust hook) | verified on the Pixel. Octo returned 200, and the game reached Home as an existing account |
+| Toggle off → official servers | verified. Connections went to the official API (35.221.155.103) and climaster; the cached CA was deleted |
+| Unrooted LSPatch over Wi-Fi with no tunnel | verified on a Moto G Play 2024 (Android 14). The module loaded, and redirect + trust reached the server |
+| New-player sign-up (Auth:Create + Firebase redirect) | implemented in sumire-sr PR #6 and in this fork's Firebase redirect. See sumire-sr `docs/SOLIS_INTEROP.md` / PR #6 for the current state |
+| Known gaps | the stale-CA window on the first home-screen launch after disabling; issuer-list visibility is process-wide |
 
