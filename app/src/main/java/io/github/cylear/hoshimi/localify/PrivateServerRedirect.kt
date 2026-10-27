@@ -90,6 +90,8 @@ object PrivateServerRedirect {
         "identitytoolkit.googleapis.com",
         "securetoken.googleapis.com",
         "www.googleapis.com",
+        // Firebase Storage (photo-mode uploads and image downloads).
+        "firebasestorage.googleapis.com",
     )
 
     private const val DEFAULT_HTTPS_PORT = 443

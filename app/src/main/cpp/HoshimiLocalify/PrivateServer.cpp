@@ -785,7 +785,7 @@ namespace HoshimiLocal::PrivateServer {
         // lists must stay in sync.
         g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com",
                            "identitytoolkit.googleapis.com", "securetoken.googleapis.com",
-                           "www.googleapis.com"};
+                           "www.googleapis.com", "firebasestorage.googleapis.com"};
         // The configured authority only needs to be known as a redirect host in handler mode, when
         // it is a hostname; an IPv4 endpoint is reached directly and would only clutter the list.
         if (!g_baseHost.empty() && !IsIpv4Literal(g_baseHost)
