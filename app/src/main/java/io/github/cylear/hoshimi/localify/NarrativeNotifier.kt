@@ -55,6 +55,9 @@ object NarrativeNotifier {
 
     private val installed = AtomicBoolean(false)
     private val lastBackgroundAt = AtomicLong(0L)
+    /** Bumped on every resume so a refresh started by an earlier pause does not re-arm alarms. */
+    private val foregroundGeneration = AtomicLong(0L)
+    private val scheduleLock = Any()
 
     /** Hooks the pause trigger and the alarm receiver. Must run early in the game process. */
     fun install(classLoader: ClassLoader) {
@@ -73,6 +76,20 @@ object NarrativeNotifier {
         }
         catch (t: Throwable) {
             Log.w(TAG, "cannot hook Activity.onPause", t)
+        }
+
+        try {
+            val activityClass = XposedHelpers.findClass("android.app.Activity", classLoader)
+            XposedBridge.hookAllMethods(activityClass, "onResume", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val activity = param.thisObject as? Activity ?: return
+                    onForeground(activity)
+                }
+            })
+            Log.i(TAG, "hooked Activity.onResume")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "cannot hook Activity.onResume", t)
         }
 
         try {
@@ -110,9 +127,10 @@ object NarrativeNotifier {
             return
         }
         val ctx = activity.applicationContext ?: return
+        val generation = foregroundGeneration.get()
         Thread {
             try {
-                refresh(ctx)
+                refresh(ctx, generation)
             }
             catch (t: Throwable) {
                 Log.w(TAG, "background refresh failed", t)
@@ -120,7 +138,29 @@ object NarrativeNotifier {
         }.start()
     }
 
-    private fun refresh(ctx: Context) {
+    /**
+     * The game is visible again: the in-game UI shows messages and calls itself, so drop the pending
+     * alarms and any notification already posted. The next pause schedules them afresh.
+     */
+    private fun onForeground(activity: Activity) {
+        foregroundGeneration.incrementAndGet()
+        // Let the next pause refresh at once, even within the debounce window.
+        lastBackgroundAt.set(0L)
+        val ctx = activity.applicationContext ?: return
+        Thread {
+            try {
+                synchronized(scheduleLock) {
+                    cancelAll(ctx)
+                }
+                clearPosted(ctx)
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "foreground cleanup failed", t)
+            }
+        }.start()
+    }
+
+    private fun refresh(ctx: Context, generation: Long) {
         val token = try {
             HoshimiHookMain.getGameAuthToken()
         }
@@ -141,19 +181,25 @@ object NarrativeNotifier {
             return
         }
 
-        cancelAll(ctx)
-        val now = System.currentTimeMillis()
-        val scheduled = ArrayList<String>()
-        for (index in 0 until items.length()) {
-            val item = items.optJSONObject(index) ?: continue
-            val dueAt = item.optLong("dueAt", 0L)
-            if (dueAt <= now) {
-                continue
+        synchronized(scheduleLock) {
+            if (foregroundGeneration.get() != generation) {
+                Log.d(TAG, "game resumed during the pending check; not scheduling")
+                return
             }
-            schedule(ctx, item, dueAt)?.let { scheduled.add(it) }
+            cancelAll(ctx)
+            val now = System.currentTimeMillis()
+            val scheduled = ArrayList<String>()
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                val dueAt = item.optLong("dueAt", 0L)
+                if (dueAt <= now) {
+                    continue
+                }
+                schedule(ctx, item, dueAt)?.let { scheduled.add(it) }
+            }
+            storeSchedules(ctx, scheduled)
+            Log.i(TAG, "scheduled ${scheduled.size} notifications")
         }
-        storeSchedules(ctx, scheduled)
-        Log.i(TAG, "scheduled ${scheduled.size} notifications")
     }
 
     /** Returns the `items` array, or null when the list could not be fetched. */
@@ -254,6 +300,21 @@ object NarrativeNotifier {
             }
         }
         storeSchedules(ctx, emptyList())
+    }
+
+    /** Removes only this module's notifications; the game's own Unity notifications stay. */
+    private fun clearPosted(ctx: Context) {
+        val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        var cleared = 0
+        for (status in manager.activeNotifications) {
+            if (status.notification.channelId == CHANNEL_ID) {
+                manager.cancel(status.tag, status.id)
+                cleared++
+            }
+        }
+        if (cleared > 0) {
+            Log.i(TAG, "cleared $cleared posted notifications")
+        }
     }
 
     private fun postNotification(ctx: Context, intent: Intent) {
