@@ -80,6 +80,9 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         // so the hooks must exist before the Unity player starts networking.
         PrivateServerTrust.install(lpparam.classLoader)
 
+        // Local notifications for idol messages/calls (the official game used FCM pushes).
+        NarrativeNotifier.install(lpparam.classLoader)
+
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
@@ -575,6 +578,10 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         )
         @JvmStatic
         external fun loadConfig(configJsonStr: String)
+
+        /** Game JWT captured from the login response; empty until the first login. */
+        @JvmStatic
+        external fun getGameAuthToken(): String
 
         // Toast fast switch content
         private var toast: Toast? = null

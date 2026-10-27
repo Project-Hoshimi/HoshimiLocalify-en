@@ -15,10 +15,14 @@ import kotlinx.serialization.json.Json
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.lang.reflect.Method
+import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
 /**
@@ -99,6 +103,46 @@ object PrivateServerTrust {
 
     @Volatile
     private var lastAugmentLogAt = 0L
+
+    // ---- in-process consumers --------------------------------------------------------------
+
+    /**
+     * Base URL of the enabled private server, as delivered by the configuration ("" when disabled).
+     * A launcher start has no `iprData`, so the cached CA is consulted first; without it the fake
+     * server URL would be unknown even though the cache proved the server was enabled.
+     */
+    internal fun currentServerUrl(): String {
+        ensureCachedCaLoaded("narrative")
+        return serverUrl
+    }
+
+    /**
+     * TLS socket factory that trusts exactly the configured private server CA, used by
+     * [NarrativeNotifier] to call the mod endpoints of the private server. Null when no CA is
+     * configured.
+     */
+    internal fun sslSocketFactory(): SSLSocketFactory? {
+        val certs = caCerts
+        if (certs.isEmpty()) {
+            return null
+        }
+        return try {
+            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+            keyStore.load(null, null)
+            certs.forEachIndexed { index, cert ->
+                keyStore.setCertificateEntry("hoshimi-private-server-$index", cert)
+            }
+            val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            factory.init(keyStore)
+            val context = SSLContext.getInstance("TLS")
+            context.init(null, factory.trustManagers, null)
+            context.socketFactory
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot build the private server SSLSocketFactory", t)
+            null
+        }
+    }
 
     /**
      * Installs the hooks that are independent of the configuration. Must be called from

@@ -40,6 +40,11 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
     override lateinit var programConfigFactory: ProgramConfigViewModelFactory
     override lateinit var programConfigViewModel: ProgramConfigViewModel
 
+    companion object {
+        // Set by NarrativeNotifier: open this activity and start the game right away.
+        const val EXTRA_AUTO_START_GAME = "hoshimiAutoStartGame"
+        const val EXTRA_GAME_PACKAGE = "hoshimiGamePackage"
+    }
 
     private fun showToast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
@@ -168,6 +173,20 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
             HoshimiLocalifyTheme(dynamicColor = false, darkTheme = false) {
                 MainUI(context = this)
             }
+        }
+
+        if (intent.getBooleanExtra(EXTRA_AUTO_START_GAME, false)) {
+            onClickStartGame(intent.getStringExtra(EXTRA_GAME_PACKAGE))
+            finish()
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_AUTO_START_GAME, false)) {
+            onClickStartGame(intent.getStringExtra(EXTRA_GAME_PACKAGE))
+            finish()
         }
     }
 }

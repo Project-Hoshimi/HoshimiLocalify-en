@@ -9,6 +9,7 @@
 #include "xdl.h"
 #include "HoshimiLocalify/camera/camera.hpp"
 #include "HoshimiLocalify/config/Config.hpp"
+#include "HoshimiLocalify/PrivateServer.hpp"
 #include "Joystick/JoystickEvent.h"
 
 JavaVM* g_javaVM = nullptr;
@@ -123,6 +124,13 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, j
     const std::string configJson = configJsonStrChars;
     env->ReleaseStringUTFChars(config_json_str, configJsonStrChars);
     HoshimiLocal::Config::LoadConfig(configJson);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_getGameAuthToken(JNIEnv *env, jclass clazz) {
+    const std::string token = HoshimiLocal::PrivateServer::GetAuthToken();
+    return env->NewStringUTF(token.c_str());
 }
 
 extern "C"

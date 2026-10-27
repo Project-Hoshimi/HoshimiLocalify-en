@@ -56,6 +56,25 @@ namespace HoshimiLocal::PrivateServer {
         std::string g_baseUrl;   // normalized: no trailing slash
         std::string g_caPem;     // trimmed configured PEM
 
+        // Game JWT from AuthLoginResponse.GameAuthToken. Captured on every login and read by the
+        // Kotlin notifier (JNI) so it can call the private server's mod endpoints after the game
+        // process has been backgrounded.
+        std::mutex g_authTokenMutex;
+        std::string g_authToken;
+        std::atomic<bool> g_authTokenLogged{false};
+
+        void StoreAuthToken(const std::string& token) {
+            if (token.empty()) return;
+            {
+                std::lock_guard<std::mutex> lock(g_authTokenMutex);
+                g_authToken = token;
+            }
+            // Never log the token itself.
+            if (!g_authTokenLogged.exchange(true)) {
+                HoshimiLocal::Log::InfoFmt("PrivateServer: captured GameAuthToken (%zu chars)", token.size());
+            }
+        }
+
         // Private server endpoint, parsed once in Install().
         std::string g_baseScheme;       // "https"
         std::string g_baseHost;         // lowercase host of g_baseUrl ("127.0.0.1")
@@ -513,6 +532,25 @@ namespace HoshimiLocal::PrivateServer {
                 ? CertificateHandler_ValidateCertificate_Orig(self, certificateData, mtd) : false;
     }
 
+    // ---- Game auth token ----
+    // AuthLoginResponse.GameAuthToken carries the JWT returned by the private server at every login
+    // (valid 7 days). Both accessors store it: the setter sees the login response, the getter covers
+    // consumers that re-read the cached response object.
+    PS_DEFINE_HOOK(void, AuthLoginResponse_set_GameAuthToken, (void* self, Il2cppString* value, void* mtd)) {
+        if (AuthLoginResponse_set_GameAuthToken_Orig) {
+            AuthLoginResponse_set_GameAuthToken_Orig(self, value, mtd);
+        }
+        if (value) StoreAuthToken(value->ToString());
+    }
+
+    PS_DEFINE_HOOK(Il2cppString*, AuthLoginResponse_get_GameAuthToken, (void* self, void* mtd)) {
+        auto orig = AuthLoginResponse_get_GameAuthToken_Orig;
+        if (!orig) return nullptr;
+        auto* result = orig(self, mtd);
+        if (result) StoreAuthToken(result->ToString());
+        return result;
+    }
+
     // ---- Hostname-preserving redirection ----
     // Used when no CertificateHandler can be attached: the URL keeps the game's hostname (so the
     // certificate Common Name / TLS SNI still match) and this hook points the connection at the
@@ -877,5 +915,19 @@ namespace HoshimiLocal::PrivateServer {
         PS_ADD_HOOK(CertificateHandler_ValidateCertificateNative, Il2cppUtils::GetMethodPointer(
                 "UnityEngine.UnityWebRequestModule.dll", "UnityEngine.Networking",
                 "CertificateHandler", "ValidateCertificateNative"));
+
+        // Always installed (independent of the redirect mode): the token is consumed by the Kotlin
+        // side, not by the redirect itself.
+        PS_ADD_HOOK(AuthLoginResponse_set_GameAuthToken, Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Common.Proto.Api", "AuthLoginResponse",
+                "set_GameAuthToken", {"*"}));
+        PS_ADD_HOOK(AuthLoginResponse_get_GameAuthToken, Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Common.Proto.Api", "AuthLoginResponse",
+                "get_GameAuthToken"));
+    }
+
+    std::string GetAuthToken() {
+        std::lock_guard<std::mutex> lock(g_authTokenMutex);
+        return g_authToken;
     }
 }
