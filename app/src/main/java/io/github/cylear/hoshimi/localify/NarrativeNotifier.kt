@@ -8,6 +8,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
@@ -52,8 +53,13 @@ object NarrativeNotifier {
     private const val FALLBACK_CHARACTER_NAME = "アイドル"
     private const val BACKGROUND_DEBOUNCE_MS = 5_000L
     private const val TIMEOUT_MS = 10_000
+    private const val POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS"
+    private const val PERMISSION_REQUEST_CODE = 0x4E41
+    private const val PERMISSION_RETRY_MS = 5_000L
+    private const val PERMISSION_RETRIES = 60
 
     private val installed = AtomicBoolean(false)
+    private val permissionAsked = AtomicBoolean(false)
     private val lastBackgroundAt = AtomicLong(0L)
     /** Bumped on every resume so a refresh started by an earlier pause does not re-arm alarms. */
     private val foregroundGeneration = AtomicLong(0L)
@@ -146,6 +152,7 @@ object NarrativeNotifier {
         foregroundGeneration.incrementAndGet()
         // Let the next pause refresh at once, even within the debounce window.
         lastBackgroundAt.set(0L)
+        requestPostPermission(activity, PERMISSION_RETRIES)
         val ctx = activity.applicationContext ?: return
         Thread {
             try {
@@ -158,6 +165,49 @@ object NarrativeNotifier {
                 Log.w(TAG, "foreground cleanup failed", t)
             }
         }.start()
+    }
+
+    /**
+     * Android 13+ blocks every post until the app holds POST_NOTIFICATIONS, and the game never asks for
+     * it (FCM pushes went through Google Play services). Asks once per process, and only in private-server
+     * mode. Waits for the game's auth token: a dialog during Unity startup left the game on a white
+     * screen on a Pixel 6, so this retries on the UI thread until the player has logged in.
+     */
+    private fun requestPostPermission(activity: Activity, retriesLeft: Int) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || permissionAsked.get()) {
+            return
+        }
+        if (activity.isFinishing || activity.isDestroyed) {
+            return
+        }
+        if (activity.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            permissionAsked.set(true)
+            return
+        }
+        val loggedIn = try {
+            HoshimiHookMain.getGameAuthToken().isNotEmpty()
+        }
+        catch (e: UnsatisfiedLinkError) {
+            false
+        }
+        if (!loggedIn || PrivateServerTrust.currentServerUrl().isEmpty()) {
+            if (retriesLeft > 0) {
+                activity.window?.decorView?.postDelayed({
+                    requestPostPermission(activity, retriesLeft - 1)
+                }, PERMISSION_RETRY_MS)
+            }
+            return
+        }
+        if (!permissionAsked.compareAndSet(false, true)) {
+            return
+        }
+        try {
+            activity.requestPermissions(arrayOf(POST_NOTIFICATIONS), PERMISSION_REQUEST_CODE)
+            Log.i(TAG, "requested $POST_NOTIFICATIONS")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "cannot request $POST_NOTIFICATIONS", t)
+        }
     }
 
     private fun refresh(ctx: Context, generation: Long) {
