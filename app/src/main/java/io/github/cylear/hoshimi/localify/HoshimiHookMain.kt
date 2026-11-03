@@ -75,6 +75,20 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
 
+        // In-game server selection state lives in the game's own sandbox. A pending switch is
+        // consumed here, before Firebase's ContentProvider in the new process reads its auth store.
+        try {
+            val dataDir = lpparam.appInfo?.dataDir
+            if (dataDir != null) {
+                val dir = File(dataDir)
+                ServerProfileStore.migrateLegacyCacheIfPresent(dir)
+                ServerProfileStore.swapPendingAccount(dir)
+            }
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: early server switch handling failed", t)
+        }
+
         // Installed before the process runs any game code: libunity.so resolves the UnityTLS root
         // list over JNI (TrustManagerFactory.getTrustManagers -> getAcceptedIssuers) and caches it,
         // so the hooks must exist before the Unity player starts networking.
@@ -173,6 +187,16 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
                 else {
                     initIprConfig(currActivity)
+                }
+                try {
+                    ServerSwitchOverlay.attach(currActivity)
+                    if (!firstResumeHandled) {
+                        firstResumeHandled = true
+                        ServerPromptDialog.maybeShowFirstLaunch(currActivity)
+                    }
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerSwitch: cannot prepare the server UI", t)
                 }
             }
         })
@@ -274,6 +298,16 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
             // configuration is seen (usually a no-op, the launch intent already delivered it).
             // A malformed payload decodes to null and is ignored by the trust layer.
+            if (initConfig != null) {
+                try {
+                    // A config that enables a private server becomes a profile on first sight, so a
+                    // later switch can come back to it with the same account.
+                    ServerProfileStore.migrateFromAppConfig(activity.filesDir, initConfig)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot migrate the app configuration", t)
+                }
+            }
             try {
                 PrivateServerTrust.observeConfig(initConfig, "iprData")
             }
@@ -412,14 +446,21 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         iprDataInited = true
         FilesChecker.initAndCheck(context.filesDir, modulePath)
         val defaultConfig = IdolyprideConfig()
-        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), defaultConfig))
-        // No module app answered the config request, so the only known configuration is the
-        // default one (private server off). Do not keep a CA cached by an earlier launch alive.
+        // No module app answered the config request, so the in-game server profile decides whether
+        // the private server is used (official by default).
         try {
-            PrivateServerTrust.observeConfig(defaultConfig, "standalone")
+            ServerProfileStore.applyActiveProfile(defaultConfig, context.filesDir)
         }
         catch (t: Throwable) {
-            Log.w(TAG, "PrivateServerTrust: cannot clear the private server CA in standalone mode", t)
+            Log.w(TAG, "ServerProfileStore: cannot read the active server profile", t)
+        }
+        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), defaultConfig))
+        // Arm the profile's CA (if any) for this process; an official profile clears it.
+        try {
+            PrivateServerTrust.observeConfig(defaultConfig, "standalone-profile")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA in standalone mode", t)
         }
         NotificationLocalizer.updateConfig(context, defaultConfig)
         Log.i(TAG, "Loaded default configuration in standalone mode.")
@@ -566,6 +607,13 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     companion object {
+        /**
+         * Set on the first Activity.onResume of the game process: the first-launch server prompt is
+         * evaluated exactly once per process.
+         */
+        @Volatile
+        private var firstResumeHandled = false
+
         @JvmStatic
         external fun initHook(targetLibraryPath: String, localizationFilesDir: String)
         @JvmStatic
@@ -614,6 +662,15 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         @JvmStatic
         external fun pluginCallbackLooper(): Int
+
+        /**
+         * Reported from the native text-probe path whenever the top of the current Unity screen
+         * hierarchy changes; drives the "Switch server" overlay visibility.
+         */
+        @JvmStatic
+        fun onScreenRootChanged(root: String) {
+            ServerSwitchOverlay.onScreenRootChanged(root)
+        }
     }
 
     init {
