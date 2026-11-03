@@ -75,14 +75,19 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
 
+        mainProcess = lpparam.processName == lpparam.packageName
+
         // In-game server selection state lives in the game's own sandbox. A pending switch is
         // consumed here, before Firebase's ContentProvider in the new process reads its auth store.
+        // Only the main process may touch the shared account files.
         try {
             val dataDir = lpparam.appInfo?.dataDir
             if (dataDir != null) {
                 val dir = File(dataDir)
                 ServerProfileStore.migrateLegacyCacheIfPresent(dir)
-                ServerProfileStore.swapPendingAccount(dir)
+                if (mainProcess) {
+                    ServerProfileStore.swapPendingAccount(dir)
+                }
             }
         }
         catch (t: Throwable) {
@@ -168,6 +173,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 Log.d(TAG, "onStart")
                 val currActivity = param.thisObject as Activity
                 gameActivity = currActivity
+                activityResumed = false
                 if (getConfigError != null) {
                     showGetConfigFailed(currActivity)
                 }
@@ -182,6 +188,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 Log.d(TAG, "onResume")
                 val currActivity = param.thisObject as Activity
                 gameActivity = currActivity
+                activityResumed = true
                 if (getConfigError != null) {
                     showGetConfigFailed(currActivity)
                 }
@@ -190,10 +197,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
                 try {
                     ServerSwitchOverlay.attach(currActivity)
-                    if (!firstResumeHandled) {
-                        firstResumeHandled = true
-                        ServerPromptDialog.maybeShowFirstLaunch(currActivity)
-                    }
+                    maybeShowFirstLaunch(currActivity)
                 }
                 catch (t: Throwable) {
                     Log.w(TAG, "ServerSwitch: cannot prepare the server UI", t)
@@ -371,6 +375,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             if (initConfig != null) NotificationLocalizer.updateConfig(activity, initConfig)
             Log.d(TAG, "iprData: $iprData")
             checkTranslationUpdate(activity)
+            afterConfigResolved(activity)
         }
     }
 
@@ -464,6 +469,39 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
         NotificationLocalizer.updateConfig(context, defaultConfig)
         Log.i(TAG, "Loaded default configuration in standalone mode.")
+        afterConfigResolved(context as? Activity ?: gameActivity)
+    }
+
+    /**
+     * Latch for the first-launch picker: the prompt must wait until the app configuration was
+     * actually resolved, so it can see a profiled server chosen through the module app.
+     */
+    private fun afterConfigResolved(activity: Activity?) {
+        configResolved = true
+        val current = activity ?: gameActivity
+        if (current != null && activityResumed) {
+            maybeShowFirstLaunch(current)
+        }
+    }
+
+    private fun maybeShowFirstLaunch(activity: Activity) {
+        if (!mainProcess || !configResolved || firstLaunchPromptHandled) return
+        try {
+            if (ServerProfileStore.appManagedPrivateServer) return
+            if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
+            firstLaunchPromptHandled = true
+            activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    // Let the next resumed activity try again instead of losing the prompt.
+                    firstLaunchPromptHandled = false
+                    return@runOnUiThread
+                }
+                ServerPromptDialog.maybeShowFirstLaunch(activity)
+            }
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "ServerSwitch: cannot schedule the first-launch server prompt", t)
+        }
     }
 
     private fun checkPluginVersion(activity: Activity, readVersion: String?) {
@@ -608,11 +646,20 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         /**
-         * Set on the first Activity.onResume of the game process: the first-launch server prompt is
-         * evaluated exactly once per process.
+         * The first-launch server prompt waits for configuration resolution and is evaluated at
+         * most once per process. The account swap and the prompt only run in the main process.
          */
         @Volatile
-        private var firstResumeHandled = false
+        private var mainProcess = false
+
+        @Volatile
+        private var configResolved = false
+
+        @Volatile
+        private var activityResumed = false
+
+        @Volatile
+        private var firstLaunchPromptHandled = false
 
         @JvmStatic
         external fun initHook(targetLibraryPath: String, localizationFilesDir: String)

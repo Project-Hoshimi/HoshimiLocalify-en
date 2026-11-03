@@ -62,6 +62,7 @@ object ServerPromptDialog {
      */
     fun maybeShowFirstLaunch(activity: Activity) {
         try {
+            if (activity.isFinishing || activity.isDestroyed) return
             if (ServerProfileStore.appManagedPrivateServer) return
             if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
             show(activity)
@@ -73,6 +74,10 @@ object ServerPromptDialog {
 
     /** Opens the picker. Also used by the "Switch server" overlay button. */
     fun show(activity: Activity) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: ignoring the server dialog for a finished activity")
+            return
+        }
         if (showing) {
             Log.i(TAG, "ServerSwitch: the server dialog is already open")
             return
@@ -255,23 +260,32 @@ object ServerPromptDialog {
                 BootstrapResult(error = readableError(t))
             }
             activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    Log.i(TAG, "ServerSwitch: the activity is gone; dropping the CA bootstrap result")
+                    return@runOnUiThread
+                }
                 try {
                     progress.dismiss()
                 }
                 catch (_: Throwable) {
                 }
-                when {
-                    result.error != null -> showBootstrapError(activity, result.error, rawText, listDialog)
-                    result.profile == null ->
-                        showBootstrapError(
-                            activity,
-                            "The server did not return a valid CA certificate.",
-                            rawText,
-                            listDialog
-                        )
-                    result.needsConfirmation ->
-                        confirmFingerprint(activity, result.profile, listDialog)
-                    else -> acceptProfile(activity, result.profile, listDialog)
+                try {
+                    when {
+                        result.error != null -> showBootstrapError(activity, result.error, rawText, listDialog)
+                        result.profile == null ->
+                            showBootstrapError(
+                                activity,
+                                "The server did not return a valid CA certificate.",
+                                rawText,
+                                listDialog
+                            )
+                        result.needsConfirmation ->
+                            confirmFingerprint(activity, result.profile, listDialog)
+                        else -> acceptProfile(activity, result.profile, listDialog)
+                    }
+                }
+                catch (t: Throwable) {
+                    Log.e(TAG, "ServerSwitch: cannot show the CA bootstrap result", t)
                 }
             }
         }.start()
@@ -432,6 +446,10 @@ object ServerPromptDialog {
         profile: ServerProfile,
         listDialog: AlertDialog
     ) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: the activity is gone; skipping the fingerprint dialog")
+            return
+        }
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(activity, 20), dp(activity, 8), dp(activity, 20), 0)
@@ -453,19 +471,24 @@ object ServerPromptDialog {
             setTextColor(Color.GRAY)
         }, matchWidth())
 
-        AlertDialog.Builder(activity)
-            .setTitle("Trust this server?")
-            .setView(ScrollView(activity).apply { addView(container) })
-            .setPositiveButton("Trust") { d, _ ->
-                d.dismiss()
-                acceptProfile(activity, profile, listDialog)
-            }
-            .setNegativeButton("Cancel") { d, _ ->
-                d.dismiss()
-                restartList(activity, listDialog)
-            }
-            .setOnCancelListener { restartList(activity, listDialog) }
-            .show()
+        try {
+            AlertDialog.Builder(activity)
+                .setTitle("Trust this server?")
+                .setView(ScrollView(activity).apply { addView(container) })
+                .setPositiveButton("Trust") { d, _ ->
+                    d.dismiss()
+                    acceptProfile(activity, profile, listDialog)
+                }
+                .setNegativeButton("Cancel") { d, _ ->
+                    d.dismiss()
+                    restartList(activity, listDialog)
+                }
+                .setOnCancelListener { restartList(activity, listDialog) }
+                .show()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerSwitch: cannot show the fingerprint dialog", t)
+        }
     }
 
     private fun acceptProfile(activity: Activity, profile: ServerProfile, listDialog: AlertDialog) {
@@ -492,20 +515,29 @@ object ServerPromptDialog {
         rawText: String,
         listDialog: AlertDialog
     ) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: the activity is gone; skipping the bootstrap error dialog")
+            return
+        }
         var retry = false
-        AlertDialog.Builder(activity)
-            .setTitle("Server")
-            .setMessage(message)
-            .setPositiveButton("Retry") { d, _ ->
-                retry = true
-                d.dismiss()
-            }
-            .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
-            .setOnDismissListener {
-                if (retry) promptForUrl(activity, listDialog, initial = rawText)
-                else restartList(activity, listDialog)
-            }
-            .show()
+        try {
+            AlertDialog.Builder(activity)
+                .setTitle("Server")
+                .setMessage(message)
+                .setPositiveButton("Retry") { d, _ ->
+                    retry = true
+                    d.dismiss()
+                }
+                .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+                .setOnDismissListener {
+                    if (retry) promptForUrl(activity, listDialog, initial = rawText)
+                    else restartList(activity, listDialog)
+                }
+                .show()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerSwitch: cannot show the bootstrap error dialog", t)
+        }
     }
 
     private fun shortFingerprint(fingerprint: String): String =
