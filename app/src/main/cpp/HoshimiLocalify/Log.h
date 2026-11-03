@@ -19,6 +19,10 @@ namespace HoshimiLocal::Log {
     void ShowToast(const char* text);
     void ShowToastFmt(const char* fmt, ...);
     void ToastLoop(JNIEnv *env, jclass clazz);
+
+    // Latest detected UI screen root, consumed by the Kotlin side through ScreenRootLoop.
+    void SetScreenRoot(const std::string& root);
+    void ScreenRootLoop(JNIEnv *env, jclass clazz);
 }
 
 #endif //IDOLYPRIDE_LOCALIFY_LOG_H

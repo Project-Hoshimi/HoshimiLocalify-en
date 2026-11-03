@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -151,6 +152,51 @@ namespace HoshimiLocal::PrivateServer {
             return parts == 4;
         }
 
+        // Resolves the private server's hostname to an IPv4 literal. Only called from Install(),
+        // before any getaddrinfo hook is installed, so the real libc resolver runs and the redirect
+        // cannot recurse into itself. The result is cached for the lifetime of the process.
+        std::mutex g_resolvedHostsMutex;
+        std::unordered_map<std::string, std::string> g_resolvedHosts;
+
+        std::string ResolveHostIpv4(const std::string& host) {
+            if (host.empty() || IsIpv4Literal(host)) return host;
+            {
+                std::lock_guard<std::mutex> lock(g_resolvedHostsMutex);
+                const auto cached = g_resolvedHosts.find(host);
+                if (cached != g_resolvedHosts.end()) return cached->second;
+            }
+
+            std::string result;
+            addrinfo hints {};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* resolved = nullptr;
+            const int error = ::getaddrinfo(host.c_str(), nullptr, &hints, &resolved);
+            if (error != 0) {
+                HoshimiLocal::Log::ErrorFmt("PrivateServer: cannot resolve %s: %s", host.c_str(),
+                                            gai_strerror(error));
+            }
+            else {
+                for (auto* node = resolved; node; node = node->ai_next) {
+                    if (!node->ai_addr || node->ai_addrlen < sizeof(sockaddr_in)) continue;
+                    char buffer[INET_ADDRSTRLEN] = {};
+                    const auto* address = reinterpret_cast<const sockaddr_in*>(node->ai_addr);
+                    if (::inet_ntop(AF_INET, &address->sin_addr, buffer, sizeof(buffer))) {
+                        result = buffer;
+                        break;
+                    }
+                }
+                ::freeaddrinfo(resolved);
+            }
+
+            if (!result.empty()) {
+                HoshimiLocal::Log::InfoFmt("PrivateServer: resolved %s -> %s", host.c_str(), result.c_str());
+                std::lock_guard<std::mutex> lock(g_resolvedHostsMutex);
+                g_resolvedHosts[host] = result;
+            }
+            return result;
+        }
+
         std::string FirstPemBodyLine(const std::string& pem) {
             const std::string begin = "-----BEGIN CERTIFICATE-----";
             const auto beginPos = pem.find(begin);
@@ -218,6 +264,8 @@ namespace HoshimiLocal::PrivateServer {
         }
 
         bool IsRedirectHost(const std::string& host) {
+            // The private server's own hostname is the destination, never a redirect source.
+            if (!g_baseHost.empty() && host == g_baseHost) return false;
             for (const auto& candidate : g_redirectHosts) {
                 if (host == candidate) return true;
             }
@@ -824,12 +872,9 @@ namespace HoshimiLocal::PrivateServer {
         g_redirectHosts = {"api.game-idolypride.jp", "climaster.game-idolypride.jp", "api.octo-cloud.com",
                            "identitytoolkit.googleapis.com", "securetoken.googleapis.com",
                            "www.googleapis.com", "firebasestorage.googleapis.com"};
-        // The configured authority only needs to be known as a redirect host in handler mode, when
-        // it is a hostname; an IPv4 endpoint is reached directly and would only clutter the list.
-        if (!g_baseHost.empty() && !IsIpv4Literal(g_baseHost)
-                && std::find(g_redirectHosts.begin(), g_redirectHosts.end(), g_baseHost) == g_redirectHosts.end()) {
-            g_redirectHosts.push_back(g_baseHost);
-        }
+        // The configured authority is the destination, never a redirect source: adding it (or the
+        // hostname it resolves from) to this list would route the private server back into its own
+        // redirect. An IPv4 endpoint is reached directly, a hostname endpoint is resolved below.
 
         // Two ways to reach the private server:
         //  * handler mode - the configured authority (usually an IP) is used and our
@@ -840,9 +885,13 @@ namespace HoshimiLocal::PrivateServer {
         ProbeCertificateHandlerSurface();
         ResolveFieldOffsets();
         const bool handlerMode = !g_caPem.empty() && g_handlerSurface.Usable();
-        g_preserveHost = endpointOk && !handlerMode && g_baseScheme == "https" && IsIpv4Literal(g_baseHost);
+        // Hostname-preserving mode needs an IPv4 literal to point getaddrinfo at, so a hostname
+        // endpoint (public sumire instance) is resolved here with the real resolver.
+        const std::string baseAddress =
+                (endpointOk && !handlerMode && g_baseScheme == "https") ? ResolveHostIpv4(g_baseHost) : "";
+        g_preserveHost = !baseAddress.empty();
         if (g_preserveHost) {
-            g_baseAddress = g_baseHost;
+            g_baseAddress = baseAddress;
         }
 
         // Every hook below reads g_baseUrl / g_baseAddress / g_redirectHosts / g_preserveHost and the
@@ -859,8 +908,9 @@ namespace HoshimiLocal::PrivateServer {
                                    g_preserveHost ? g_baseAddress.c_str() : g_baseHost.c_str(),
                                    g_basePort.c_str(), hostList.c_str(), g_caPem.size());
         if (!g_preserveHost && !handlerMode) {
-            HoshimiLocal::Log::Error("PrivateServer: no usable CertificateHandler and the endpoint is not an "
-                                     "IPv4 literal; TLS will fall back to the system trust store");
+            HoshimiLocal::Log::ErrorFmt("PrivateServer: no usable CertificateHandler and %s is not a usable "
+                                        "IPv4 endpoint; TLS will fall back to the system trust store",
+                                        g_baseHost.c_str());
         }
 
         if (g_preserveHost) {

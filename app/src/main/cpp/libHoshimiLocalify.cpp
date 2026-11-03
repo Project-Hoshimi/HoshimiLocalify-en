@@ -193,6 +193,7 @@ JNIEXPORT jint JNICALL
 Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIEnv *env,
                                                                              jclass clazz) {
     // HoshimiLocal::Log::ToastLoop(env, clazz);
+    HoshimiLocal::Log::ScreenRootLoop(env, clazz);
 
     if (UnityResolveProgress::startInit) {
         return 9;

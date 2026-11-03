@@ -28,6 +28,9 @@ extern jmethodID showToastMethodId;
 namespace HoshimiLocal::Log {
     namespace {
         std::queue<std::string> showingToasts{};
+        // Only the newest screen root matters: the Kotlin overlay just shows/hides a button.
+        std::string pendingScreenRoot{};
+        bool hasPendingScreenRoot = false;
     }
 
     std::string StringFormat(const char* fmt, ...) {
@@ -138,6 +141,38 @@ namespace HoshimiLocal::Log {
         }
         else {
             _showToastMethodId = env->GetStaticMethodID(clazz, "showToast", "(Ljava/lang/String;)V");
+        }
+    }
+
+    void SetScreenRoot(const std::string& root) {
+        if (root.empty()) return;
+        pendingScreenRoot = root;
+        hasPendingScreenRoot = true;
+    }
+
+    // Mirrors ToastLoop: drains the newest detected screen root to the Kotlin overlay.
+    void ScreenRootLoop(JNIEnv *env, jclass clazz) {
+        if (!hasPendingScreenRoot || !env || !clazz) return;
+
+        const std::string root = pendingScreenRoot;
+        hasPendingScreenRoot = false;
+        pendingScreenRoot.clear();
+
+        static auto onScreenRootChangedMethodId =
+            env->GetStaticMethodID(clazz, "onScreenRootChanged", "(Ljava/lang/String;)V");
+        if (!onScreenRootChangedMethodId) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            Debug("ScreenRootLoop: onScreenRootChanged is missing");
+            return;
+        }
+
+        jstring param = env->NewStringUTF(root.c_str());
+        if (!param) return;
+        env->CallStaticVoidMethod(clazz, onScreenRootChangedMethodId, param);
+        env->DeleteLocalRef(param);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            DebugFmt("ScreenRootLoop: onScreenRootChanged threw for %s", root.c_str());
         }
     }
 }

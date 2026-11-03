@@ -1374,7 +1374,44 @@ namespace HoshimiLocal::HookMain {
         return RestoreJoinedLineBreaks(origText, newStr);
     }
 
+    // ---- In-game server switch: guess the current screen from the UI text paths ----
+    // The first segment of the component path names the screen root (e.g. "Title/...").
+    // Throttled to one path computation every 300 ms; changes are reported to Kotlin, which
+    // shows the "Switch server" button while the root contains ServerSwitchOverlay's marker.
+    void ProbeScreenRoot(void* textComponent) {
+        if (!textComponent) return;
+        static auto lastProbe = std::chrono::steady_clock::time_point{};
+        static std::string lastRoot{};
+        const auto now = std::chrono::steady_clock::now();
+        if (lastProbe.time_since_epoch().count() != 0 &&
+            now - lastProbe < std::chrono::milliseconds(300)) {
+            return;
+        }
+        lastProbe = now;
+
+        std::string path;
+        try {
+            path = GetUnityComponentPath(textComponent);
+        }
+        catch (...) {
+            return;
+        }
+        if (path.empty() || path[0] == '<') return;
+
+        // Unnamed transforms produce a leading separator.
+        const auto start = path.find_first_not_of('/');
+        if (start == std::string::npos) return;
+        const auto end = path.find('/', start);
+        const std::string root = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (root.empty() || root == lastRoot) return;
+
+        lastRoot = root;
+        Log::InfoFmt("ServerSwitch: screen root -> %s", root.c_str());
+        Log::SetScreenRoot(root);
+    }
+
     void ProbeTextComponent(void* textComponent, const std::string& text) {
+        ProbeScreenRoot(textComponent);
         TryApplyLiveHudGeometry(textComponent, text);
         FitOrientationSelectorLabel(textComponent, text);
         if (!Config::debugMasterDbLog || !textComponent) return;

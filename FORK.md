@@ -99,6 +99,70 @@ configured private-server CA, and otherwise rethrows the platform verdict. Hosts
 5. Server side: run sumire-sr with `TLS=1 HTTP2=1 PORT=8443` and **leave `PUBLIC_BASE_URL` unset** (default `https://api.game-idolypride.jp`), so master download URLs keep the game hostname. Setting it to an IP causes "Curl error 60 … Common Name does not match".
 6. Switch off = official servers: no redirect hooks are installed, and the cached CA is deleted.
 
+## In-game server selection
+
+One build covers the official server and any number of private sumire-sr servers, and players
+pick the server inside the game. The module app is not required: this works in standalone mode
+(LSPatch-embedded module, app not installed).
+
+- **Switch server button.** `ServerSwitchOverlay.kt` adds a small native `Button` to the game
+  activity's content view. Native code (`Hook.cpp`, `ProbeTextComponent`) reports the first
+  segment of the current UI text component path through the JNI callback
+  `HoshimiHookMain.onScreenRootChanged`; the button is visible while that root contains
+  `TITLE_SCREEN_ROOT_MARKER` (`Title`) and hidden everywhere else. The marker is a single
+  constant and is tuned against the emulator; the detected root is logged as
+  `ServerSwitch: screen root -> <name>`.
+- **Picker.** `ServerPromptDialog.kt` builds a plain `AlertDialog` in code (no layout
+  resources): "Official server", every saved private profile, and "Add private server…". It is
+  shown on the first `onResume` when no server has been chosen yet, and from the switch button.
+- **Adding a server.** The address may be `host:port`, `https://host[:port]` or
+  `http://host[:port]`, optionally with `#sha256=<fingerprint>`. A missing scheme means https and
+  a missing port is the scheme default. The CA is bootstrapped from
+  `<url>/.well-known/sumire/ca.pem`: a certificate chain the system already trusts is accepted
+  silently; an untrusted (self-signed) instance is fetched once with a trust-all connection for
+  the bootstrap request only, the returned CA must have signed the presented leaf certificate,
+  and the player confirms the CA fingerprint unless `#sha256=` matched. Plain `http://` always
+  requires the confirmation.
+- **Account separation.** Each server has its own login, and the refresh token is bound to the
+  server, so switching swaps whole account file sets instead of sharing one. This means a
+  restart: `pending.json` is written, the launch intent is scheduled 500 ms later, and the
+  process is killed. On the next start `HoshimiHookMain.handleLoadPackage` (before Firebase's
+  ContentProvider runs) moves the current profile's account files into
+  `files/hoshimi-profiles/<activeId>/account/` and restores the target profile's set. Only
+  `shared_prefs/com.google.firebase.auth.api.Store.*.xml`,
+  `shared_prefs/game.qualiarts.idolypride.v2.playerprefs.xml` and `files/octo/user/` move;
+  asset and master caches under `files/octo/v1` and `files/octo/pdb` stay shared.
+
+Files under `<game dataDir>/files/hoshimi-profiles/` (managed by `ServerProfileStore.kt`):
+
+| File | Contents |
+|---|---|
+| `profiles.json` | `{id, kind: "official"\|"private", url, caPem, caSha256, label}`; `official` always exists |
+| `active.json` | `{activeId}` |
+| `pending.json` | `{targetId}`, written only while a switch is in flight |
+| `<profileId>/account/` | that server's account files (private profiles only) |
+
+A private profile id is `private-` plus the first 8 hex chars of the SHA-1 of the normalized URL
+(lowercase scheme and host, no trailing slash).
+
+Precedence:
+
+1. An `iprData` config from the module app with **private server enabled and a URL** wins; that is
+   how the existing sumire-sr dev setup keeps working. It is also mirrored into a
+   `private-…` profile. While it is in charge, the switch button shows "Server is managed by the
+   HoshimiLocalify app" instead of the picker.
+2. Otherwise the active profile decides: `official` disables the private server, `private`
+   enables it with that profile's URL and CA. An app config with private server off does not
+   disarm an active private profile.
+3. With no `active.json` (first launch), a legacy cached CA at `files/hoshimi-private-server-ca.pem`
+   is migrated into a profile, otherwise the official profile is created and the picker is shown.
+
+The CA cache keeps a `# source=profile|app` marker so a CA derived from an in-game profile is
+dropped when the active profile becomes official, while an app-supplied CA behaves as before.
+A private server may be an IPv4 literal or a hostname (public instance): the Java redirect
+resolves the hostname through the original resolver and `PrivateServer.cpp` resolves it once in
+`Install()` (before its own `getaddrinfo` hook exists), caching the address.
+
 ## Status
 
 | Piece | State |
