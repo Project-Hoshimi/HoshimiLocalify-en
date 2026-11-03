@@ -25,6 +25,17 @@ object ServerSwitchOverlay {
     /** Substring of the current screen root that means "title screen". Tuned after emulator tests. */
     const val TITLE_SCREEN_ROOT_MARKER = "Title"
 
+    /**
+     * Root suffixes of full game screens (e.g. `HomeWindow(Clone)`, `StoryPlayerScreen(Clone)`).
+     * Only these hide the button again. Shared layers such as `Canvas` and
+     * `Singleton(DontDestroy)` also report text while the title is up, so they must not count
+     * as leaving the title screen.
+     */
+    private val GAME_SCREEN_ROOT_SUFFIXES = listOf("Window(Clone)", "Screen(Clone)")
+
+    /** Raise the button off the bottom edge by this fraction of the screen height. */
+    private const val BOTTOM_OFFSET_FRACTION = 0.22f
+
     private const val BUTTON_TEXT = "Switch server"
     private const val MANAGED_MESSAGE = "Server is managed by the HoshimiLocalify app"
     private const val MARGIN_DP = 12
@@ -39,6 +50,10 @@ object ServerSwitchOverlay {
     @Volatile
     private var currentRoot: String = ""
 
+    /** Latched title state: set by a title root, cleared only by a full game screen root. */
+    @Volatile
+    private var onTitleScreen: Boolean = false
+
     private var activityRef: WeakReference<Activity>? = null
     private var buttonRef: WeakReference<Button>? = null
 
@@ -52,7 +67,7 @@ object ServerSwitchOverlay {
             if (activity.isFinishing) return
             val existing = buttonRef?.get()
             if (existing != null && activityRef?.get() === activity && existing.parent != null) {
-                existing.visibility = visibilityFor(currentRoot)
+                existing.visibility = currentVisibility()
                 return
             }
             if (existing?.parent != null) {
@@ -72,7 +87,7 @@ object ServerSwitchOverlay {
                     dp(activity, PADDING_H_DP),
                     dp(activity, PADDING_V_DP)
                 )
-                visibility = visibilityFor(currentRoot)
+                visibility = currentVisibility()
                 setOnClickListener { onButtonClicked(activity) }
             }
             val params = FrameLayout.LayoutParams(
@@ -81,7 +96,9 @@ object ServerSwitchOverlay {
                 Gravity.BOTTOM or Gravity.START
             ).apply {
                 val margin = dp(activity, MARGIN_DP)
-                setMargins(margin, margin, margin, margin)
+                val bottom = margin +
+                        (activity.resources.displayMetrics.heightPixels * BOTTOM_OFFSET_FRACTION).toInt()
+                setMargins(margin, margin, margin, bottom)
             }
             root.addView(button, params)
             activityRef = WeakReference(activity)
@@ -113,11 +130,18 @@ object ServerSwitchOverlay {
     fun onScreenRootChanged(root: String) {
         handler.post {
             try {
-                currentRoot = cleanScreenRoot(root)
+                val cleaned = cleanScreenRoot(root)
+                currentRoot = cleaned
+                if (cleaned.contains(TITLE_SCREEN_ROOT_MARKER, ignoreCase = true)) {
+                    onTitleScreen = true
+                }
+                else if (GAME_SCREEN_ROOT_SUFFIXES.any { cleaned.endsWith(it) }) {
+                    onTitleScreen = false
+                }
                 val activity = activityRef?.get() ?: return@post
                 val button = buttonRef?.get() ?: return@post
                 if (activity.isFinishing || activity.isDestroyed) return@post
-                button.visibility = visibilityFor(root)
+                button.visibility = currentVisibility()
             }
             catch (t: Throwable) {
                 Log.w(TAG, "ServerSwitch: cannot update the overlay visibility", t)
@@ -125,11 +149,8 @@ object ServerSwitchOverlay {
         }
     }
 
-    private fun visibilityFor(root: String): Int =
-        if (isTitleScreen(root)) View.VISIBLE else View.GONE
-
-    private fun isTitleScreen(root: String): Boolean =
-        cleanScreenRoot(root).contains(TITLE_SCREEN_ROOT_MARKER, ignoreCase = true)
+    private fun currentVisibility(): Int =
+        if (onTitleScreen) View.VISIBLE else View.GONE
 
     /** Drops the ` [component=...]` suffix and anything after the first path separator. */
     private fun cleanScreenRoot(root: String): String {
