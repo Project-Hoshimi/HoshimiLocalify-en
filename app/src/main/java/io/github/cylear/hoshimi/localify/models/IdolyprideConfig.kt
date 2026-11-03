@@ -31,13 +31,15 @@ data class IdolyprideConfig (
     var liveCustomeHeadId: String = "",
     var liveCustomeCostumeId: String = "",
 
-    var loginAsIOS: Boolean = false,
 
     var privateServerEnabled: Boolean = false,
     var privateServerUrl: String = "",
     var privateServerCaPem: String = "",
 
     var useCustomeGraphicSettings: Boolean = false,
+    var graphicQuality: Int = 0,
+    var antiAliasingMode: Int = -1,
+    var shadowResolution: Int = 0,
     var renderScale: Float = 0.77f,
     var qualitySettingsLevel: Int = 3,
     var volumeIndex: Int = 3,

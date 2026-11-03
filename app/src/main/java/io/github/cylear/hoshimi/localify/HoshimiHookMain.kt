@@ -83,6 +83,10 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         // Local notifications for idol messages/calls (the official game used FCM pushes).
         NarrativeNotifier.install(lpparam.classLoader)
 
+        if (nativeLibLoadSuccess) {
+            NotificationTranslationHook.install(lpparam.packageName)
+        }
+
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
@@ -330,6 +334,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
 
             loadConfig(iprData)
+            if (initConfig != null) NotificationLocalizer.updateConfig(activity, initConfig)
             Log.d(TAG, "iprData: $iprData")
             checkTranslationUpdate(activity)
         }
@@ -416,6 +421,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         catch (t: Throwable) {
             Log.w(TAG, "PrivateServerTrust: cannot clear the private server CA in standalone mode", t)
         }
+        NotificationLocalizer.updateConfig(context, defaultConfig)
         Log.i(TAG, "Loaded default configuration in standalone mode.")
     }
 

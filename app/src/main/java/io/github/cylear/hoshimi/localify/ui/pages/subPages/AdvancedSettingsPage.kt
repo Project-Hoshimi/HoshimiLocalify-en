@@ -92,9 +92,6 @@ fun AdvanceSettingsPage(modifier: Modifier = Modifier,
                             v -> context?.onForceExportResourceChanged(v)
                     }
 
-                    IPSwitch(modifier, stringResource(R.string.login_as_ios), checked = config.value.loginAsIOS) {
-                            v -> context?.onLoginAsIOSChanged(v)
-                    }
                 }
             }
 
