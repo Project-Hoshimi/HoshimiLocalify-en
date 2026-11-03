@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <queue>
+#include <mutex>
 #include <cstdarg>
 
 #include <android/log.h>
@@ -31,6 +32,7 @@ namespace HoshimiLocal::Log {
         // Only the newest screen root matters: the Kotlin overlay just shows/hides a button.
         std::string pendingScreenRoot{};
         bool hasPendingScreenRoot = false;
+        std::mutex screenRootMutex{};
     }
 
     std::string StringFormat(const char* fmt, ...) {
@@ -146,17 +148,23 @@ namespace HoshimiLocal::Log {
 
     void SetScreenRoot(const std::string& root) {
         if (root.empty()) return;
+        std::lock_guard<std::mutex> guard(screenRootMutex);
         pendingScreenRoot = root;
         hasPendingScreenRoot = true;
     }
 
     // Mirrors ToastLoop: drains the newest detected screen root to the Kotlin overlay.
     void ScreenRootLoop(JNIEnv *env, jclass clazz) {
-        if (!hasPendingScreenRoot || !env || !clazz) return;
+        if (!env || !clazz) return;
 
-        const std::string root = pendingScreenRoot;
-        hasPendingScreenRoot = false;
-        pendingScreenRoot.clear();
+        std::string root;
+        {
+            std::lock_guard<std::mutex> guard(screenRootMutex);
+            if (!hasPendingScreenRoot) return;
+            root = pendingScreenRoot;
+            hasPendingScreenRoot = false;
+            pendingScreenRoot.clear();
+        }
 
         static auto onScreenRootChangedMethodId =
             env->GetStaticMethodID(clazz, "onScreenRootChanged", "(Ljava/lang/String;)V");
