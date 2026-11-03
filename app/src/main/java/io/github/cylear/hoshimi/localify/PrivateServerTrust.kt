@@ -652,6 +652,21 @@ object PrivateServerTrust {
             return
         }
         val file = File(context.filesDir, CACHE_FILE_NAME)
+        // Once active.json exists, the profile store owns the decision. If it resolves to the
+        // official server and the app has not enabled a private server in this process, the legacy
+        // cache file must never arm trust (and is removed). The legacy fallback is only for the
+        // pre-migration case where active.json does not exist yet.
+        if (ServerProfileStore.hasActiveId(context.filesDir) &&
+            !ServerProfileStore.appManagedPrivateServer
+        ) {
+            Log.i(
+                TAG,
+                "PrivateServerTrust: active.json selects a non-private server and the app has not " +
+                        "enabled the private server; refusing the cached CA ($source)"
+            )
+            deleteCachedCa(file)
+            return
+        }
         val cached = readCachedCa(file, source) ?: return
         if (cached.source == CACHE_SOURCE_PROFILE) {
             // The profile this cache belongs to is no longer active (the player switched to the
