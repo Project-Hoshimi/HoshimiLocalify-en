@@ -11,6 +11,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
@@ -42,8 +44,19 @@ data class ServerProfile(
 @Serializable
 private data class ActiveProfileFile(val activeId: String)
 
+/**
+ * Journal of an in-flight account swap, consumed at process start.
+ *
+ * [phase] is one of `begin`, `stashing`, `stashed` and `restoring`. [attempts] is
+ * incremented and persisted before any file work so an interrupted run can be detected.
+ */
 @Serializable
-private data class PendingProfileFile(val targetId: String)
+private data class PendingProfileFile(
+    val targetId: String,
+    val fromId: String = "",
+    val phase: String = "begin",
+    val attempts: Int = 0,
+)
 
 /**
  * In-game server selection state, shared by the game process only.
@@ -67,6 +80,17 @@ object ServerProfileStore {
 
     private const val PROFILE_DIR_NAME = "hoshimi-profiles"
     private const val ACCOUNT_DIR_NAME = "account"
+    private const val ACCOUNT_NEW_DIR_NAME = "account.new"
+    private const val ACCOUNT_OLD_DIR_NAME = "account.old"
+
+    private const val PHASE_BEGIN = "begin"
+    private const val PHASE_STASHING = "stashing"
+    private const val PHASE_STASHED = "stashed"
+    private const val PHASE_RESTORING = "restoring"
+    private const val MAX_SWAP_ATTEMPTS = 3
+
+    private const val CORRUPT_SUFFIX = ".corrupt"
+    private const val TEMP_SUFFIX = ".tmp"
 
     private const val LEGACY_CA_CACHE = "hoshimi-private-server-ca.pem"
     private const val LEGACY_ENABLED_PREFIX = "# enabled="
@@ -103,6 +127,42 @@ object ServerProfileStore {
         appManagedPrivateServer = enabled
     }
 
+    // ---- atomic file writes --------------------------------------------------------------
+
+    /**
+     * Writes [text] to `<name>.tmp`, fsyncs it and renames it over [target]. A failure is logged at
+     * Error and rethrown so callers that must not continue (the account swap) can react.
+     */
+    private fun writeAtomically(target: File, text: String) {
+        target.parentFile?.mkdirs()
+        val temp = File(target.parentFile, target.name + TEMP_SUFFIX)
+        try {
+            FileOutputStream(temp).use { out ->
+                out.write(text.toByteArray(Charsets.UTF_8))
+                out.flush()
+                out.fd.sync()
+            }
+            if (!temp.renameTo(target)) {
+                // renameTo does not replace on every filesystem; fall back to delete + rename.
+                if (target.exists() && !target.delete()) {
+                    throw IOException("cannot replace ${target.absolutePath}")
+                }
+                if (!temp.renameTo(target)) {
+                    throw IOException("cannot rename ${temp.absolutePath} to ${target.absolutePath}")
+                }
+            }
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot write ${target.absolutePath}", t)
+            try {
+                temp.delete()
+            }
+            catch (ignored: Throwable) {
+            }
+            throw t
+        }
+    }
+
     // ---- locations -----------------------------------------------------------------------
 
     fun profilesDir(filesDir: File): File = File(filesDir, PROFILE_DIR_NAME)
@@ -133,6 +193,7 @@ object ServerProfileStore {
     private fun loadProfilesLocked(filesDir: File): List<ServerProfile> {
         val dir = profilesDir(filesDir)
         val file = File(dir, FILE_PROFILES)
+        var corrupt = false
         val parsed = try {
             if (file.isFile) {
                 json.decodeFromString(profileListSerializer, file.readText())
@@ -142,7 +203,21 @@ object ServerProfileStore {
             }
         }
         catch (t: Throwable) {
-            Log.w(TAG, "ServerProfileStore: cannot read ${file.absolutePath}; rebuilding", t)
+            corrupt = true
+            Log.e(TAG, "ServerProfileStore: cannot parse ${file.absolutePath}", t)
+            // Keep the bad file for diagnosis, but never rebuild it over the top.
+            try {
+                val corruptFile = File(dir, FILE_PROFILES + CORRUPT_SUFFIX)
+                if (corruptFile.exists()) corruptFile.delete()
+                if (!file.renameTo(corruptFile)) {
+                    file.copyTo(corruptFile, overwrite = true)
+                    file.delete()
+                }
+                Log.e(TAG, "ServerProfileStore: kept the unreadable file as ${corruptFile.absolutePath}")
+            }
+            catch (moveError: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot preserve the unreadable profiles.json", moveError)
+            }
             emptyList()
         }
         val result = ArrayList<ServerProfile>(parsed.size + 1)
@@ -152,7 +227,10 @@ object ServerProfileStore {
             if (result.any { it.id == profile.id }) continue
             result.add(profile)
         }
-        if (result.size != parsed.size || result.firstOrNull()?.kind != ServerProfile.KIND_OFFICIAL) {
+        // A corrupt file is treated as empty for this run only; do not overwrite it here.
+        if (!corrupt &&
+            (result.size != parsed.size || result.firstOrNull()?.kind != ServerProfile.KIND_OFFICIAL)
+        ) {
             saveProfilesLocked(filesDir, result)
         }
         return result
@@ -160,13 +238,13 @@ object ServerProfileStore {
 
     private fun saveProfilesLocked(filesDir: File, profiles: List<ServerProfile>) {
         try {
-            val dir = profilesDir(filesDir)
-            dir.mkdirs()
-            val file = File(dir, FILE_PROFILES)
-            file.writeText(json.encodeToString(profileListSerializer, profiles))
+            writeAtomically(
+                File(profilesDir(filesDir), FILE_PROFILES),
+                json.encodeToString(profileListSerializer, profiles)
+            )
         }
         catch (t: Throwable) {
-            Log.w(TAG, "ServerProfileStore: cannot write profiles.json", t)
+            Log.e(TAG, "ServerProfileStore: cannot write profiles.json", t)
         }
     }
 
@@ -199,6 +277,13 @@ object ServerProfileStore {
         }
     }
 
+    /** True when `active.json` exists, even if it cannot be read. */
+    fun hasActiveId(filesDir: File): Boolean {
+        synchronized(lock) {
+            return File(profilesDir(filesDir), FILE_ACTIVE).isFile
+        }
+    }
+
     private fun readActiveIdLocked(filesDir: File): String? {
         val file = File(profilesDir(filesDir), FILE_ACTIVE)
         return try {
@@ -214,67 +299,101 @@ object ServerProfileStore {
 
     fun writeActiveId(filesDir: File, profileId: String) {
         synchronized(lock) {
-            writeActiveIdLocked(filesDir, profileId)
+            try {
+                writeActiveIdLocked(filesDir, profileId)
+            }
+            catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot write active.json", t)
+            }
         }
     }
 
     private fun writeActiveIdLocked(filesDir: File, profileId: String) {
-        try {
-            val dir = profilesDir(filesDir)
-            dir.mkdirs()
-            File(dir, FILE_ACTIVE).writeText(
-                json.encodeToString(ActiveProfileFile.serializer(), ActiveProfileFile(profileId))
-            )
-            Log.i(TAG, "ServerProfileStore: active profile -> $profileId")
-        }
-        catch (t: Throwable) {
-            Log.w(TAG, "ServerProfileStore: cannot write active.json", t)
-        }
+        writeAtomically(
+            File(profilesDir(filesDir), FILE_ACTIVE),
+            json.encodeToString(ActiveProfileFile.serializer(), ActiveProfileFile(profileId))
+        )
+        Log.i(TAG, "ServerProfileStore: active profile -> $profileId")
     }
 
     fun readPendingTarget(filesDir: File): String? {
         synchronized(lock) {
-            val file = File(profilesDir(filesDir), FILE_PENDING)
-            return try {
-                if (!file.isFile) return null
-                json.decodeFromString(PendingProfileFile.serializer(), file.readText()).targetId
-                    .takeIf { it.isNotBlank() }
-            }
-            catch (t: Throwable) {
-                Log.w(TAG, "ServerProfileStore: cannot read pending.json", t)
-                null
-            }
+            return readPendingLocked(filesDir)?.targetId
         }
     }
 
-    fun writePendingTarget(filesDir: File, targetId: String) {
-        synchronized(lock) {
-            try {
-                val dir = profilesDir(filesDir)
-                dir.mkdirs()
-                File(dir, FILE_PENDING).writeText(
-                    json.encodeToString(PendingProfileFile.serializer(), PendingProfileFile(targetId))
+    private fun readPendingLocked(filesDir: File): PendingProfileFile? {
+        val file = File(profilesDir(filesDir), FILE_PENDING)
+        return try {
+            if (!file.isFile) return null
+            val pending = json.decodeFromString(PendingProfileFile.serializer(), file.readText())
+            if (pending.targetId.isBlank()) return null
+            val phase = when (pending.phase) {
+                PHASE_BEGIN -> PHASE_BEGIN
+                PHASE_STASHING -> PHASE_STASHING
+                PHASE_STASHED -> PHASE_STASHED
+                PHASE_RESTORING -> PHASE_RESTORING
+                else -> PHASE_BEGIN
+            }
+            pending.copy(phase = phase)
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot read pending.json", t)
+            null
+        }
+    }
+
+    /** Starts a switch journal. Returns false when the journal could not be persisted. */
+    private fun beginPendingSwitchLocked(filesDir: File, targetId: String): Boolean {
+        val fromId = readActiveIdLocked(filesDir) ?: ServerProfile.OFFICIAL_ID
+        return try {
+            writePendingLocked(
+                filesDir,
+                PendingProfileFile(
+                    targetId = targetId,
+                    fromId = fromId,
+                    phase = PHASE_BEGIN,
+                    attempts = 0
                 )
-                Log.i(TAG, "ServerProfileStore: pending switch -> $targetId")
-            }
-            catch (t: Throwable) {
-                Log.w(TAG, "ServerProfileStore: cannot write pending.json", t)
-            }
+            )
+            Log.i(TAG, "ServerProfileStore: pending switch -> $targetId (from $fromId)")
+            true
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot write pending.json", t)
+            false
+        }
+    }
+
+    private fun writePendingLocked(filesDir: File, pending: PendingProfileFile) {
+        writeAtomically(
+            File(profilesDir(filesDir), FILE_PENDING),
+            json.encodeToString(PendingProfileFile.serializer(), pending)
+        )
+    }
+
+    fun writePendingTarget(filesDir: File, targetId: String): Boolean {
+        synchronized(lock) {
+            return beginPendingSwitchLocked(filesDir, targetId)
         }
     }
 
     fun deletePending(filesDir: File) {
         synchronized(lock) {
-            val file = File(profilesDir(filesDir), FILE_PENDING)
-            try {
-                if (file.isFile) {
-                    file.delete()
-                    Log.i(TAG, "ServerProfileStore: pending switch cleared")
-                }
+            deletePendingLocked(filesDir)
+        }
+    }
+
+    private fun deletePendingLocked(filesDir: File) {
+        val file = File(profilesDir(filesDir), FILE_PENDING)
+        try {
+            if (file.isFile) {
+                file.delete()
+                Log.i(TAG, "ServerProfileStore: pending switch cleared")
             }
-            catch (t: Throwable) {
-                Log.w(TAG, "ServerProfileStore: cannot delete pending.json", t)
-            }
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot delete pending.json", t)
         }
     }
 
@@ -288,9 +407,18 @@ object ServerProfileStore {
         synchronized(lock) {
             val activeId = readActiveIdLocked(filesDir) ?: return null
             if (activeId == ServerProfile.OFFICIAL_ID) return null
-            return loadProfilesLocked(filesDir).firstOrNull {
+            val profiles = loadProfilesLocked(filesDir)
+            val profile = profiles.firstOrNull {
                 it.id == activeId && it.kind == ServerProfile.KIND_PRIVATE && it.url.isNotBlank()
             }
+            if (profile == null) {
+                Log.e(
+                    TAG,
+                    "ServerProfileStore: active.json names missing or unusable profile $activeId; " +
+                            "treating the official server as active (active.json left untouched)"
+                )
+            }
+            return profile
         }
     }
 
@@ -326,7 +454,12 @@ object ServerProfileStore {
             if (existing != null) return existing
 
             migrateLegacyCacheLocked(filesDir)?.let { return it }
-            writeActiveIdLocked(filesDir, ServerProfile.OFFICIAL_ID)
+            try {
+                writeActiveIdLocked(filesDir, ServerProfile.OFFICIAL_ID)
+            }
+            catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot persist the initial active profile", t)
+            }
             Log.i(TAG, "ServerProfileStore: first start, active profile is official")
             return ServerProfile.OFFICIAL_ID
         }
@@ -384,31 +517,160 @@ object ServerProfileStore {
     }
 
     /**
-     * Consumes `pending.json`: files the active server's account, restores the target server's
-     * account, then flips `active.json`. Runs before Firebase's ContentProvider in the new process,
-     * so no component can read a token that belongs to the previous server.
+     * Consumes `pending.json` through a small journaled protocol:
+     *
+     *  1. `begin`     - drop any stale `account.new`, then move to `stashing`.
+     *  2. `stashing`  - move every live account file into `<from>/account.new` (idempotent).
+     *  3. `stashed`   - replace `<from>/account` with `account.new` (recoverable).
+     *  4. `restoring` - copy (never move) `<target>/account` back to the live locations, then
+     *                   atomically flip `active.json` and delete `pending.json`.
+     *
+     * The attempt counter is persisted before any file work. Up to [MAX_SWAP_ATTEMPTS] launches
+     * retry the persisted phase; beyond that the swap is aborted and the `from` account is restored.
+     * Runs before Firebase's ContentProvider in the new process, so no component can read a token
+     * that belongs to the previous server.
      */
     fun swapPendingAccount(dataDir: File) {
         val filesDir = File(dataDir, "files")
-        val targetId = readPendingTarget(filesDir) ?: return
-        try {
-            val activeId = ensureInitialized(dataDir)
-            if (activeId == targetId) {
-                Log.i(TAG, "ServerProfileStore: pending target $targetId is already active; nothing to swap")
-                deletePending(filesDir)
+        synchronized(lock) {
+            val stored = readPendingLocked(filesDir) ?: return
+            val fromId = stored.fromId.takeIf { it.isNotBlank() }
+                ?: readActiveIdLocked(filesDir)
+                ?: ServerProfile.OFFICIAL_ID
+            var state = stored.copy(fromId = fromId)
+
+            if (state.targetId == state.fromId) {
+                Log.i(
+                    TAG,
+                    "ServerProfileStore: pending target ${state.targetId} is already active; nothing to swap"
+                )
+                deletePendingLocked(filesDir)
                 return
             }
-            Log.i(TAG, "ServerProfileStore: swapping account files $activeId -> $targetId")
-            saveAccountFiles(dataDir, filesDir, activeId)
-            restoreAccountFiles(dataDir, filesDir, targetId)
-            writeActiveId(filesDir, targetId)
-            deletePending(filesDir)
-            Log.i(TAG, "ServerProfileStore: server switch to $targetId complete")
+
+            state = state.copy(attempts = state.attempts + 1)
+            try {
+                writePendingLocked(filesDir, state)
+            }
+            catch (t: Throwable) {
+                // Without a persisted attempt counter a retry could loop forever; stop here.
+                Log.e(
+                    TAG,
+                    "ServerProfileStore: cannot persist the swap journal; leaving pending.json untouched",
+                    t
+                )
+                return
+            }
+
+            if (state.attempts > MAX_SWAP_ATTEMPTS) {
+                abortSwap(dataDir, filesDir, state)
+                return
+            }
+
+            Log.i(
+                TAG,
+                "ServerProfileStore: account swap ${state.fromId} -> ${state.targetId} " +
+                        "(attempt ${state.attempts}, phase ${state.phase})"
+            )
+
+            try {
+                while (true) {
+                    when (state.phase) {
+                        PHASE_BEGIN -> {
+                            // A leftover account.new belongs to an interrupted earlier attempt.
+                            deleteRecursively(
+                                File(File(profilesDir(filesDir), state.fromId), ACCOUNT_NEW_DIR_NAME)
+                            )
+                            state = state.copy(phase = PHASE_STASHING)
+                            writePendingLocked(filesDir, state)
+                        }
+
+                        PHASE_STASHING -> {
+                            stashAccountFiles(dataDir, filesDir, state.fromId)
+                            state = state.copy(phase = PHASE_STASHED)
+                            writePendingLocked(filesDir, state)
+                        }
+
+                        PHASE_STASHED -> {
+                            replaceStash(filesDir, state.fromId)
+                            state = state.copy(phase = PHASE_RESTORING)
+                            writePendingLocked(filesDir, state)
+                        }
+
+                        PHASE_RESTORING -> {
+                            restoreAccountFiles(dataDir, filesDir, state.targetId)
+                            writeActiveIdLocked(filesDir, state.targetId)
+                            deletePendingLocked(filesDir)
+                            Log.i(
+                                TAG,
+                                "ServerProfileStore: server switch to ${state.targetId} complete; " +
+                                        "the per-profile stash is kept as a backup"
+                            )
+                            return
+                        }
+
+                        else -> {
+                            state = state.copy(phase = PHASE_BEGIN)
+                            writePendingLocked(filesDir, state)
+                        }
+                    }
+                }
+            }
+            catch (t: Throwable) {
+                if (state.attempts > MAX_SWAP_ATTEMPTS) {
+                    abortSwap(dataDir, filesDir, state)
+                }
+                else {
+                    // Keep the journal: the next launch retries from the persisted phase.
+                    Log.e(
+                        TAG,
+                        "ServerProfileStore: account swap ${state.fromId} -> ${state.targetId} " +
+                                "failed in phase ${state.phase}; will retry on the next launch",
+                        t
+                    )
+                }
+            }
         }
-        catch (t: Throwable) {
-            // Files are left as they are on purpose: a half-swapped account is worse than a retry.
-            Log.e(TAG, "ServerProfileStore: account swap to $targetId failed; keeping $targetId pending", t)
-            deletePending(filesDir)
+    }
+
+    /**
+     * Gives up on a swap that failed too often and restores the `from` account. If the live files
+     * were already moved into `account.new`, those are copied back; if the replacement happened,
+     * `account` holds the `from` account. Files are copied, never moved, so the stash stays intact.
+     */
+    private fun abortSwap(dataDir: File, filesDir: File, state: PendingProfileFile) {
+        Log.e(
+            TAG,
+            "ServerProfileStore: aborting account swap ${state.fromId} -> ${state.targetId} after " +
+                    "${state.attempts} attempts; restoring the ${state.fromId} account"
+        )
+        try {
+            val fromRoot = File(profilesDir(filesDir), state.fromId)
+            val accountNew = File(fromRoot, ACCOUNT_NEW_DIR_NAME)
+            val account = File(fromRoot, ACCOUNT_DIR_NAME)
+            val restoreFrom = when {
+                accountNew.isDirectory -> accountNew
+                account.isDirectory &&
+                        (state.phase == PHASE_STASHED || state.phase == PHASE_RESTORING) -> account
+                else -> null
+            }
+            if (restoreFrom != null) {
+                for (entry in accountEntries(dataDir)) deleteRecursively(entry)
+                copyStashToLive(dataDir, restoreFrom)
+                Log.e(TAG, "ServerProfileStore: live account files restored from ${restoreFrom.absolutePath}")
+            }
+            else {
+                Log.e(TAG, "ServerProfileStore: live account files were never stashed; leaving them in place")
+            }
+            try {
+                writeActiveIdLocked(filesDir, state.fromId)
+            }
+            catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot restore active.json to ${state.fromId}", t)
+            }
+        }
+        finally {
+            deletePendingLocked(filesDir)
         }
     }
 
@@ -427,41 +689,92 @@ object ServerProfileStore {
         return entries
     }
 
-    private fun saveAccountFiles(dataDir: File, filesDir: File, profileId: String) {
-        val account = accountDir(filesDir, profileId)
-        deleteRecursively(account)
-        account.mkdirs()
+    /**
+     * Moves every live account file into `<profileId>/account.new`. Safe to call again after a
+     * crash: entries that were already moved are simply no longer live.
+     */
+    private fun stashAccountFiles(dataDir: File, filesDir: File, profileId: String) {
+        val stashing = File(File(profilesDir(filesDir), profileId), ACCOUNT_NEW_DIR_NAME)
+        stashing.mkdirs()
         for (entry in accountEntries(dataDir)) {
             val relative = entry.relativeTo(dataDir).path
-            val destination = File(account, relative)
+            val destination = File(stashing, relative)
             destination.parentFile?.mkdirs()
             Log.i(TAG, "ServerProfileStore: stashing $relative for $profileId")
             move(entry, destination)
         }
     }
 
+    /**
+     * Replaces `<profileId>/account` with `account.new`. Recoverable: `account.new` may already be
+     * missing when the rename completed before a crash, and `account` may be missing after the
+     * first rename. Leaves no `account.old` behind.
+     */
+    private fun replaceStash(filesDir: File, profileId: String) {
+        val root = File(profilesDir(filesDir), profileId)
+        val account = File(root, ACCOUNT_DIR_NAME)
+        val stashing = File(root, ACCOUNT_NEW_DIR_NAME)
+        val old = File(root, ACCOUNT_OLD_DIR_NAME)
+
+        if (!stashing.exists() && account.exists()) {
+            // The replacement already happened in an earlier attempt.
+            deleteRecursively(old)
+            return
+        }
+        if (old.exists() && !account.exists()) {
+            // Crashed after `account` was renamed to `account.old`.
+            if (stashing.exists() && !stashing.renameTo(account)) {
+                throw IOException("cannot rename ${stashing.absolutePath} to ${account.absolutePath}")
+            }
+            deleteRecursively(old)
+            return
+        }
+        if (account.exists()) {
+            deleteRecursively(old)
+            if (!account.renameTo(old)) {
+                throw IOException("cannot rename ${account.absolutePath} to ${old.absolutePath}")
+            }
+        }
+        if (stashing.exists() && !stashing.renameTo(account)) {
+            throw IOException("cannot rename ${stashing.absolutePath} to ${account.absolutePath}")
+        }
+        deleteRecursively(old)
+    }
+
+    /**
+     * Copies the target profile's stash back to the live locations, deleting whatever is live at
+     * each path first. The stash is never consumed, so it doubles as the profile's backup.
+     */
     private fun restoreAccountFiles(dataDir: File, filesDir: File, profileId: String) {
         val account = accountDir(filesDir, profileId)
         if (!account.isDirectory) {
             Log.i(TAG, "ServerProfileStore: no saved account for $profileId; the game will create one")
+            for (entry in accountEntries(dataDir)) deleteRecursively(entry)
             return
         }
-        val sharedPrefs = File(account, FIREBASE_STORE_DIR)
-        sharedPrefs.listFiles()?.sortedBy { it.name }?.forEach { source ->
-            if (!source.isFile) return@forEach
-            val relative = source.relativeTo(account).path
-            val destination = File(dataDir, relative)
-            destination.parentFile?.mkdirs()
-            Log.i(TAG, "ServerProfileStore: restoring $relative for $profileId")
-            move(source, destination)
+        copyStashToLive(dataDir, account)
+    }
+
+    private fun copyStashToLive(dataDir: File, stash: File) {
+        stash.listFiles()?.sortedBy { it.name }?.forEach { source ->
+            copyEntryToLive(dataDir, stash, source)
         }
-        val userDir = File(account, OCTO_USER_DIR)
-        if (userDir.exists()) {
-            val destination = File(dataDir, OCTO_USER_DIR)
-            Log.i(TAG, "ServerProfileStore: restoring $OCTO_USER_DIR for $profileId")
-            move(userDir, destination)
+    }
+
+    private fun copyEntryToLive(dataDir: File, stashRoot: File, source: File) {
+        val relative = source.relativeTo(stashRoot).path
+        val destination = File(dataDir, relative)
+        if (source.isDirectory) {
+            destination.mkdirs()
+            source.listFiles()?.sortedBy { it.name }?.forEach { child ->
+                copyEntryToLive(dataDir, stashRoot, child)
+            }
+            return
         }
-        deleteRecursively(account)
+        destination.parentFile?.mkdirs()
+        if (destination.exists()) deleteRecursively(destination)
+        Log.i(TAG, "ServerProfileStore: restoring $relative")
+        source.copyTo(destination, overwrite = true)
     }
 
     /** Renames when possible (same filesystem), copies and deletes otherwise. */
@@ -495,7 +808,10 @@ object ServerProfileStore {
      */
     fun requestSwitch(activity: Activity, targetId: String) {
         val filesDir = activity.filesDir
-        writePendingTarget(filesDir, targetId)
+        if (!writePendingTarget(filesDir, targetId)) {
+            Log.e(TAG, "ServerProfileStore: cannot journal the switch to $targetId; not relaunching")
+            return
+        }
         val relaunch = try {
             activity.packageManager.getLaunchIntentForPackage(activity.packageName)
         }
