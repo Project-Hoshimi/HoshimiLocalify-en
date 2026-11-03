@@ -312,8 +312,26 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     Log.w(TAG, "ServerProfileStore: cannot migrate the app configuration", t)
                 }
             }
+            // The app's private-server setting wins only when it enables one; otherwise the
+            // in-game active profile decides, and native must see that same decision.
+            var effectiveIprData = iprData
+            // "standalone-*" tells the trust layer this config is the active profile, not an
+            // app configuration that enables the private server.
+            var observeSource = "iprData"
+            if (initConfig != null && !initConfig.privateServerEnabled) {
+                try {
+                    ServerProfileStore.applyActiveProfile(initConfig, activity.filesDir)
+                    effectiveIprData = json.encodeToString(IdolyprideConfig.serializer(), initConfig)
+                    observeSource = "standalone-profile-over-app"
+                    Log.i(TAG, "ServerProfileStore: native config follows the active profile " +
+                            "(private=${initConfig.privateServerEnabled})")
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot apply the active profile to the app config", t)
+                }
+            }
             try {
-                PrivateServerTrust.observeConfig(initConfig, "iprData")
+                PrivateServerTrust.observeConfig(initConfig, observeSource)
             }
             catch (t: Throwable) {
                 Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA from iprData", t)
@@ -371,7 +389,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
             }
 
-            loadConfig(iprData)
+            loadConfig(effectiveIprData)
             if (initConfig != null) NotificationLocalizer.updateConfig(activity, initConfig)
             Log.d(TAG, "iprData: $iprData")
             checkTranslationUpdate(activity)
