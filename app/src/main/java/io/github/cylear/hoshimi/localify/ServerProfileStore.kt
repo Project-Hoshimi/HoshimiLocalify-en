@@ -648,14 +648,21 @@ object ServerProfileStore {
             val fromRoot = File(profilesDir(filesDir), state.fromId)
             val accountNew = File(fromRoot, ACCOUNT_NEW_DIR_NAME)
             val account = File(fromRoot, ACCOUNT_DIR_NAME)
+            // account.new only holds this swap's files once stashing has started; in `begin` it may
+            // be a stale leftover. After the replacement, `account` holds the from account.
             val restoreFrom = when {
-                accountNew.isDirectory -> accountNew
-                account.isDirectory &&
-                        (state.phase == PHASE_STASHED || state.phase == PHASE_RESTORING) -> account
+                (state.phase == PHASE_STASHING || state.phase == PHASE_STASHED) &&
+                        accountNew.isDirectory -> accountNew
+                (state.phase == PHASE_STASHED || state.phase == PHASE_RESTORING) &&
+                        account.isDirectory -> account
                 else -> null
             }
             if (restoreFrom != null) {
-                for (entry in accountEntries(dataDir)) deleteRecursively(entry)
+                // While stashing, some live files were not moved yet: keep them and only put the
+                // stashed ones back. Once fully stashed, anything live belongs to the target.
+                if (state.phase == PHASE_STASHED || state.phase == PHASE_RESTORING) {
+                    for (entry in accountEntries(dataDir)) deleteRecursively(entry)
+                }
                 copyStashToLive(dataDir, restoreFrom)
                 Log.e(TAG, "ServerProfileStore: live account files restored from ${restoreFrom.absolutePath}")
             }
