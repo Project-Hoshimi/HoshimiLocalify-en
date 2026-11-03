@@ -16,6 +16,7 @@
 #include <algorithm>
 #include "BaseDefine.h"
 #include "string_parser/StringParser.hpp"
+#include "string_parser/DictionaryPatterns.hpp"
 
 // #include "cpprest/details/http_helpers.h"
 
@@ -27,6 +28,9 @@ namespace HoshimiLocal::Local {
     std::unordered_map<std::string, std::string> genericText{};
     std::unordered_map<std::string, std::string> genericSplitText{};
     std::unordered_map<std::string, std::string> genericFmtText{};
+    std::unordered_map<std::string, std::string> genericDictionaryText{};
+    DictionaryPatterns::Matcher genericDictionaryMatcher;
+    bool genericDataLoaded = false;
     std::vector<std::string> genericTextDumpData{};
     std::vector<std::string> genericSplittedDumpData{};
     std::vector<std::string> genericOrigTextDumpData{};
@@ -162,7 +166,10 @@ namespace HoshimiLocal::Local {
         std::unordered_map<std::string, std::string> loadedData;
         LoadJsonDataToMap(filePath, loadedData, true, true, needCheckSplitPrefix);
         for (auto& [key, value] : loadedData) {
-            if (IsGenericFmtKey(key)) {
+            if (genericDictionaryMatcher.HasDictionaryPlaceholder(key)) {
+                genericDictionaryText[key] = std::move(value);
+            }
+            else if (IsGenericFmtKey(key)) {
                 genericFmtText[key] = std::move(value);
             }
             else {
@@ -416,17 +423,19 @@ namespace HoshimiLocal::Local {
         return ret;
     }
 
-    void LoadData() {
+    bool LoadDataFromPath(const std::filesystem::path& basePath, bool onlyIfMissing) {
         std::unique_lock<std::shared_mutex> lock(localDataMutex);
+        if (onlyIfMissing && genericDataLoaded) return true;
         std::lock_guard<std::mutex> dumpLock(dumpDataMutex);
-        static auto localizationFile = GetBasePath() / "local-files" / "localization.json";
-        static auto genericFile = GetBasePath() / "local-files" / "generic.json";
-        static auto genericSplitFile = GetBasePath() / "local-files" / "generic.split.json";
-        static auto genericDir = GetBasePath() / "local-files" / "genericTrans";
+        const auto localizationFile = basePath / "local-files" / "localization.json";
+        const auto genericFile = basePath / "local-files" / "generic.json";
+        const auto genericSplitFile = basePath / "local-files" / "generic.split.json";
+        const auto genericDir = basePath / "local-files" / "genericTrans";
+        const auto dictionaryFile = basePath / "local-files" / "prefill_dictionary.json";
 
         if (!std::filesystem::is_regular_file(localizationFile)) {
             Log::ErrorFmt("localizationFile: %s not found.", localizationFile.c_str());
-            return;
+            return false;
         }
         LoadJsonDataToMap(localizationFile, i18nData, true);
         Log::InfoFmt("%ld localization items loaded.", i18nData.size());
@@ -434,6 +443,18 @@ namespace HoshimiLocal::Local {
         genericText.clear();
         genericSplitText.clear();
         genericFmtText.clear();
+        genericDictionaryText.clear();
+        genericDictionaryMatcher.Clear();
+        if (std::filesystem::is_regular_file(dictionaryFile)) {
+            try {
+                std::ifstream file(dictionaryFile);
+                genericDictionaryMatcher.LoadDictionary(nlohmann::json::parse(file));
+            }
+            catch (const std::exception& exception) {
+                genericDictionaryMatcher.Clear();
+                Log::ErrorFmt("Load %s failed: %s", dictionaryFile.string().c_str(), exception.what());
+            }
+        }
         LoadJsonDataToMap(genericSplitFile, genericSplitText, true, true, true);
         LoadGenericJsonData(genericFile, true);
         if (std::filesystem::exists(genericDir) || std::filesystem::is_directory(genericDir)) {
@@ -451,8 +472,23 @@ namespace HoshimiLocal::Local {
             }
         }
         ProcessGenericTextLabels();
+        const auto invalidDictionaryPatterns = genericDictionaryMatcher.SetPatterns(genericDictionaryText);
+        for (const auto& source : invalidDictionaryPatterns) {
+            Log::ErrorFmt("Invalid generic dictionary pattern: %s", source.c_str());
+        }
         Log::InfoFmt("%ld generic text items loaded.", genericText.size());
         Log::InfoFmt("%ld generic format text items loaded.", genericFmtText.size());
+        Log::InfoFmt("%ld generic dictionary pattern items loaded.", genericDictionaryText.size() - invalidDictionaryPatterns.size());
+        genericDataLoaded = true;
+        return true;
+    }
+
+    void LoadData() {
+        LoadDataFromPath(GetBasePath(), false);
+    }
+
+    bool EnsureNotificationData(const std::filesystem::path& basePath) {
+        return LoadDataFromPath(basePath, true);
     }
 
     bool GetI18n(const std::string& key, std::string* ret) {
@@ -713,6 +749,8 @@ namespace HoshimiLocal::Local {
                 }
             }
         }
+
+        if (genericDictionaryMatcher.Match(origText, newStr)) return true;
 
         auto ret = false;
 

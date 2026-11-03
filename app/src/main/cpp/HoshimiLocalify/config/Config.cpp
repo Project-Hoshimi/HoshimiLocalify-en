@@ -1,4 +1,5 @@
 #include <string>
+#include "Config.hpp"
 #include "nlohmann/json.hpp"
 #include "../Log.h"
 #include <thread>
@@ -35,11 +36,13 @@ namespace HoshimiLocal::Config {
     std::string liveCustomeHeadId = "";
     std::string liveCustomeCostumeId = "";
 
-    bool loginAsIOS = false;
 
     bool useCustomeGraphicSettings = false;
     float renderScale = 0.77f;
     int qualitySettingsLevel = 3;
+    int graphicQuality = 0;
+    int antiAliasingMode = -1;
+    int shadowResolution = 0;
     int volumeIndex = 3;
     int maxBufferPixel = 3384;
     int reflectionQualityLevel = 4;
@@ -67,14 +70,18 @@ namespace HoshimiLocal::Config {
     bool dmmUnlockSize = false;
 
     std::string ReplaceDisplayUserName(std::string text) {
-        if (text.empty() || displayUserName.empty()) return text;
+        return ReplaceDisplayUserName(std::move(text), displayUserName);
+    }
+
+    std::string ReplaceDisplayUserName(std::string text, const std::string& userName) {
+        if (text.empty() || userName.empty()) return text;
 
         constexpr const char* placeholder = "{user}";
         constexpr size_t placeholderLength = 6;
         size_t pos = 0;
         while ((pos = text.find(placeholder, pos)) != std::string::npos) {
-            text.replace(pos, placeholderLength, displayUserName);
-            pos += displayUserName.length();
+            text.replace(pos, placeholderLength, userName);
+            pos += userName.length();
         }
         return text;
     }
@@ -111,10 +118,12 @@ namespace HoshimiLocal::Config {
             GetConfigItem(enableLiveCustomeDress);
             GetConfigItem(liveCustomeHeadId);
             GetConfigItem(liveCustomeCostumeId);
-            GetConfigItem(loginAsIOS);
             GetConfigItem(useCustomeGraphicSettings);
             GetConfigItem(renderScale);
             GetConfigItem(qualitySettingsLevel);
+            graphicQuality = config.value("graphicQuality", 0);
+            antiAliasingMode = config.value("antiAliasingMode", -1);
+            shadowResolution = config.value("shadowResolution", 0);
             GetConfigItem(volumeIndex);
             GetConfigItem(maxBufferPixel);
             GetConfigItem(reflectionQualityLevel);
@@ -177,10 +186,12 @@ namespace HoshimiLocal::Config {
             SetConfigItem(enableLiveCustomeDress);
             SetConfigItem(liveCustomeHeadId);
             SetConfigItem(liveCustomeCostumeId);
-            SetConfigItem(loginAsIOS);
             SetConfigItem(useCustomeGraphicSettings);
             SetConfigItem(renderScale);
             SetConfigItem(qualitySettingsLevel);
+            SetConfigItem(graphicQuality);
+            SetConfigItem(antiAliasingMode);
+            SetConfigItem(shadowResolution);
             SetConfigItem(volumeIndex);
             SetConfigItem(maxBufferPixel);
             SetConfigItem(reflectionQualityLevel);
