@@ -114,7 +114,8 @@ pick the server inside the game. The module app is not required: this works in s
   `ServerSwitch: screen root -> <name>`.
 - **Picker.** `ServerPromptDialog.kt` builds a plain `AlertDialog` in code (no layout
   resources): "Official server", every saved private profile, and "Add private server…". It is
-  shown on the first `onResume` when no server has been chosen yet, and from the switch button.
+  shown once configuration resolution finished (the module app answered or the standalone
+  fallback ran) when no server has been chosen yet, and from the switch button.
 - **Adding a server.** The address may be `host:port`, `https://host[:port]` or
   `http://host[:port]`, optionally with `#sha256=<fingerprint>`. A missing scheme means https and
   a missing port is the scheme default. The CA is bootstrapped from
@@ -127,9 +128,12 @@ pick the server inside the game. The module app is not required: this works in s
   server, so switching swaps whole account file sets instead of sharing one. This means a
   restart: `pending.json` is written, the launch intent is scheduled 500 ms later, and the
   process is killed. On the next start `HoshimiHookMain.handleLoadPackage` (before Firebase's
-  ContentProvider runs) moves the current profile's account files into
-  `files/hoshimi-profiles/<activeId>/account/` and restores the target profile's set. Only
-  `shared_prefs/com.google.firebase.auth.api.Store.*.xml`,
+  ContentProvider runs, main process only) runs a journaled swap in `ServerProfileStore.kt`:
+  `begin` → `stashing` (live files move into `<from>/account.new/`) → `stashed` (atomically
+  replace `<from>/account`) → `restoring` (copy the target's stash back, never consume it, then
+  write `active.json`). An interrupted swap retries from the persisted phase on the next launch;
+  after 3 attempts, or on an error past attempt 3, it aborts, restores the source account and
+  leaves `active.json` unchanged. Only `shared_prefs/com.google.firebase.auth.api.Store.*.xml`,
   `shared_prefs/game.qualiarts.idolypride.v2.playerprefs.xml` and `files/octo/user/` move;
   asset and master caches under `files/octo/v1` and `files/octo/pdb` stay shared.
 
@@ -139,7 +143,7 @@ Files under `<game dataDir>/files/hoshimi-profiles/` (managed by `ServerProfileS
 |---|---|
 | `profiles.json` | `{id, kind: "official"\|"private", url, caPem, caSha256, label}`; `official` always exists |
 | `active.json` | `{activeId}` |
-| `pending.json` | `{targetId}`, written only while a switch is in flight |
+| `pending.json` | `{targetId, fromId, phase, attempts}`, written while a switch is in flight or retrying |
 | `<profileId>/account/` | that server's account files (private profiles only) |
 
 A private profile id is `private-` plus the first 8 hex chars of the SHA-1 of the normalized URL
