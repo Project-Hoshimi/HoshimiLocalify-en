@@ -113,7 +113,7 @@ object ServerSwitchOverlay {
     fun onScreenRootChanged(root: String) {
         handler.post {
             try {
-                currentRoot = root
+                currentRoot = cleanScreenRoot(root)
                 val activity = activityRef?.get() ?: return@post
                 val button = buttonRef?.get() ?: return@post
                 if (activity.isFinishing || activity.isDestroyed) return@post
@@ -129,7 +129,17 @@ object ServerSwitchOverlay {
         if (isTitleScreen(root)) View.VISIBLE else View.GONE
 
     private fun isTitleScreen(root: String): Boolean =
-        root.contains(TITLE_SCREEN_ROOT_MARKER, ignoreCase = true)
+        cleanScreenRoot(root).contains(TITLE_SCREEN_ROOT_MARKER, ignoreCase = true)
+
+    /** Drops the ` [component=...]` suffix and anything after the first path separator. */
+    private fun cleanScreenRoot(root: String): String {
+        var value = root
+        val suffix = value.indexOf(" [component=")
+        if (suffix >= 0) value = value.substring(0, suffix)
+        val slash = value.indexOf('/')
+        if (slash >= 0) value = value.substring(0, slash)
+        return value
+    }
 
     private fun dp(activity: Activity, value: Int): Int =
         TypedValue.applyDimension(

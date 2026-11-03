@@ -1376,22 +1376,34 @@ namespace HoshimiLocal::HookMain {
 
     // ---- In-game server switch: guess the current screen from the UI text paths ----
     // The first segment of the component path names the screen root (e.g. "Title/...").
-    // Throttled to one path computation every 300 ms; changes are reported to Kotlin, which
-    // shows the "Switch server" button while the root contains ServerSwitchOverlay's marker.
+    // The latest probe is always remembered, but the path is computed at most once every 300 ms:
+    // if the throttle skips, the next hook call after the window processes the stored probe
+    // instead of a later screen being lost. All Unity calls stay on the hook (main) thread.
     void ProbeScreenRoot(void* textComponent) {
         if (!textComponent) return;
+
         static auto lastProbe = std::chrono::steady_clock::time_point{};
         static std::string lastRoot{};
+        static void* pendingProbe = nullptr;
+
+        // Cheap, on every probe: keep only the most recent pending component.
+        pendingProbe = textComponent;
+
         const auto now = std::chrono::steady_clock::now();
         if (lastProbe.time_since_epoch().count() != 0 &&
             now - lastProbe < std::chrono::milliseconds(300)) {
+            // The stored probe is flushed by the next hook call once the window has passed.
             return;
         }
         lastProbe = now;
 
+        void* probe = pendingProbe;
+        pendingProbe = nullptr;
+        if (!probe || !IsNativeObjectAlive(probe)) return;
+
         std::string path;
         try {
-            path = GetUnityComponentPath(textComponent);
+            path = GetUnityComponentPath(probe);
         }
         catch (...) {
             return;
@@ -1402,7 +1414,11 @@ namespace HoshimiLocal::HookMain {
         const auto start = path.find_first_not_of('/');
         if (start == std::string::npos) return;
         const auto end = path.find('/', start);
-        const std::string root = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        std::string root =
+            path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        // Drop the " [component=...]" suffix GetUnityComponentPath appends.
+        const auto componentSuffix = root.find(" [component=");
+        if (componentSuffix != std::string::npos) root.erase(componentSuffix);
         if (root.empty() || root == lastRoot) return;
 
         lastRoot = root;
