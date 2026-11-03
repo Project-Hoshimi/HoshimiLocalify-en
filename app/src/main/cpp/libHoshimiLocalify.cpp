@@ -6,6 +6,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <atomic>
 #include "string"
 #include "shadowhook.h"
 #include "xdl.h"
@@ -17,6 +18,9 @@
 JavaVM* g_javaVM = nullptr;
 jclass g_hoshimiHookMainClass = nullptr;
 jmethodID showToastMethodId = nullptr;
+
+// Set by HoshimiHookMain.requestClearUserData; consumed on the Unity main thread by Hook.cpp.
+std::atomic<bool> g_clearUserDataRequested{false};
 
 bool UnityResolveProgress::startInit = false;
 UnityResolveProgress::Progress UnityResolveProgress::assembliesProgress{};
@@ -182,6 +186,14 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, j
 }
 
 extern "C"
+JNIEXPORT void JNICALL
+Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_requestClearUserData(JNIEnv *env,
+                                                                             jclass clazz) {
+    g_clearUserDataRequested.store(true);
+    HoshimiLocal::Log::Info("ServerSwitch: clear user data requested");
+}
+
+extern "C"
 JNIEXPORT jstring JNICALL
 Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_getGameAuthToken(JNIEnv *env, jclass clazz) {
     const std::string token = HoshimiLocal::PrivateServer::GetAuthToken();
@@ -194,6 +206,8 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIE
                                                                              jclass clazz) {
     // HoshimiLocal::Log::ToastLoop(env, clazz);
     HoshimiLocal::Log::ScreenRootLoop(env, clazz);
+    HoshimiLocal::Log::TitleScreenLoop(env, clazz);
+    HoshimiLocal::Log::ClearUserDataLoop(env, clazz);
 
     if (UnityResolveProgress::startInit) {
         return 9;

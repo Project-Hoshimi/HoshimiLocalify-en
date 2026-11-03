@@ -25,9 +25,13 @@
 #include <fstream>
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <atomic>
 
 std::unordered_set<void*> hookedStubs{};
 extern std::filesystem::path hoshimiLocalPath;
+
+// Defined in libHoshimiLocalify.cpp; set by HoshimiHookMain.requestClearUserData.
+extern std::atomic<bool> g_clearUserDataRequested;
 
 
 #define DEFINE_HOOK(returnType, name, params)                                                      \
@@ -400,11 +404,61 @@ namespace HoshimiLocal::HookMain {
         return InternalSetOrientationAsync_Orig(self, type, cancellationToken, method);
     }
 
+    // Solis.Title.TitlePresenter drives the title-screen button visibility. Missing methods only
+    // log, so a game update cannot break the rest of the hooks.
+    DEFINE_HOOK(SolisUniTask, TitlePresenter_Start, (void* self, void* method)) {
+        const auto ret = TitlePresenter_Start_Orig(self, method);
+        HoshimiLocal::Log::SetTitleScreenVisible(true);
+        return ret;
+    }
+
+    DEFINE_HOOK(SolisUniTask, TitlePresenter_MoveOutGameAsync,
+                (void* self, SolisCancellationToken cancellationToken, void* method)) {
+        HoshimiLocal::Log::SetTitleScreenVisible(false);
+        return TitlePresenter_MoveOutGameAsync_Orig(self, cancellationToken, method);
+    }
+
+    DEFINE_HOOK(void, TitlePresenter_OnDestroy, (void* self, void* method)) {
+        HoshimiLocal::Log::SetTitleScreenVisible(false);
+        TitlePresenter_OnDestroy_Orig(self, method);
+    }
+
+    // Runs the game's own Delete Data routine on the Unity main thread. Returns true only when
+    // the method was resolved and the managed call returned without throwing.
+    bool ClearUserDataOnce() {
+        const auto klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.Common",
+                                                 "SolisInitializer");
+        if (!klass) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer not found");
+            return false;
+        }
+        const auto method = Il2cppUtils::il2cpp_class_get_method_from_name(
+                klass->address, "ClearUserData", 1);
+        if (!method || !method->methodPointer) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer.ClearUserData not found");
+            return false;
+        }
+
+        void* args[1] = { nullptr };  // ClearUserData(string migrationPublicUserId = null)
+        void* exception = nullptr;
+        UnityResolve::Invoke<void*>("il2cpp_runtime_invoke", method, nullptr, args, &exception);
+        if (exception) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer.ClearUserData threw");
+            return false;
+        }
+        HoshimiLocal::Log::Info("ServerSwitch: SolisInitializer.ClearUserData -> ok");
+        return true;
+    }
+
     void UpdatePhoneSubtitleOverlay();
 
     DEFINE_HOOK(void, EndCameraRendering, (void* ctx, void* camera, void* method)) {
         EndCameraRendering_Orig(ctx, camera, method);
         UpdatePhoneSubtitleOverlay();
+
+        if (g_clearUserDataRequested.exchange(false)) {
+            HoshimiLocal::Log::SetClearUserDataResult(ClearUserDataOnce());
+        }
 
         if (Config::enableFreeCamera && mainCameraCache) {
             Unity_set_fieldOfView_Orig(mainCameraCache, IPCamera::baseCamera.fov);
@@ -6492,6 +6546,38 @@ namespace HoshimiLocal::HookMain {
         ADD_HOOK(InternalSetOrientationAsync,
             Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
                 "ScreenOrientationControllerBase", "InternalSetOrientationAsync"));
+
+        // Solis.Title.TitlePresenter is the authoritative title-screen signal for the switch button.
+        // A missing method only warns; the screen-root probe keeps working as a fallback.
+        const auto titleStartAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "Start");
+        if (titleStartAddr) {
+            ADD_HOOK(TitlePresenter_Start, titleStartAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt(
+                    "ServerSwitch: TitlePresenter.Start not found; using screen roots only");
+        }
+
+        const auto titleMoveOutAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "MoveOutGameAsync",
+                {"System.Threading.CancellationToken"});
+        if (titleMoveOutAddr) {
+            ADD_HOOK(TitlePresenter_MoveOutGameAsync, titleMoveOutAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt(
+                    "ServerSwitch: TitlePresenter.MoveOutGameAsync not found");
+        }
+
+        const auto titleOnDestroyAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "OnDestroy");
+        if (titleOnDestroyAddr) {
+            ADD_HOOK(TitlePresenter_OnDestroy, titleOnDestroyAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt("ServerSwitch: TitlePresenter.OnDestroy not found");
+        }
 
         ADD_HOOK(Unity_set_position_Injected, Il2cppUtils::il2cpp_resolve_icall(
                 "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)"));

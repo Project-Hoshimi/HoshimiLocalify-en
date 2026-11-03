@@ -54,6 +54,10 @@ object ServerSwitchOverlay {
     @Volatile
     private var onTitleScreen: Boolean = false
 
+    /** True while the native `TitlePresenter` hooks say the title screen is up. */
+    @Volatile
+    private var titlePresenterActive: Boolean = false
+
     private var activityRef: WeakReference<Activity>? = null
     private var buttonRef: WeakReference<Button>? = null
 
@@ -149,8 +153,29 @@ object ServerSwitchOverlay {
         }
     }
 
+    /**
+     * Called from [HoshimiHookMain.onTitleScreenChanged] on the JNI thread; the title presenter
+     * is the authoritative source, the screen-root probe stays as a fallback.
+     */
+    fun onTitleScreenChanged(visible: Boolean) {
+        handler.post {
+            try {
+                titlePresenterActive = visible
+                onTitleScreen = visible
+                Log.i(TAG, "ServerSwitch: title presenter -> visible=$visible")
+                val activity = activityRef?.get() ?: return@post
+                val button = buttonRef?.get() ?: return@post
+                if (activity.isFinishing || activity.isDestroyed) return@post
+                button.visibility = currentVisibility()
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "ServerSwitch: cannot update the overlay from the title presenter", t)
+            }
+        }
+    }
+
     private fun currentVisibility(): Int =
-        if (onTitleScreen) View.VISIBLE else View.GONE
+        if (titlePresenterActive || onTitleScreen) View.VISIBLE else View.GONE
 
     /** Drops the ` [component=...]` suffix and anything after the first path separator. */
     private fun cleanScreenRoot(root: String): String {

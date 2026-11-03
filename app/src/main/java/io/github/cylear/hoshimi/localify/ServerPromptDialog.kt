@@ -170,14 +170,53 @@ object ServerPromptDialog {
                 dialog.dismiss()
                 return
             }
-            // Any other change restarts the process: UnityTLS caches its roots, and each server
-            // keeps its own account files (see ServerProfileStore.swapPendingAccount).
-            dialog.dismiss()
-            ServerProfileStore.requestSwitch(activity, profileId)
+            // Any other change restarts the process and clears the local account data.
+            val displayName = ServerProfileStore.loadProfiles(filesDir)
+                .firstOrNull { it.id == profileId }
+                ?.let {
+                    if (it.kind == ServerProfile.KIND_OFFICIAL) OFFICIAL_LABEL
+                    else it.label.ifBlank { it.url }
+                }
+                ?: profileId
+            confirmClearAndSwitch(activity, dialog, profileId, displayName)
         }
         catch (t: Throwable) {
             Log.e(TAG, "ServerSwitch: switch to $profileId failed", t)
             Toast.makeText(activity, "Cannot switch server: ${t.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** Warns that switching wipes the local account before it calls [ServerProfileStore.requestSwitch]. */
+    private fun confirmClearAndSwitch(
+        activity: Activity,
+        listDialog: AlertDialog,
+        profileId: String,
+        displayName: String
+    ) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: the activity is gone; skipping the switch confirmation")
+            return
+        }
+        val message = "Switching to $displayName will clear the local account data on this " +
+                "device (the same as Title > Account > Delete Data). Your account itself is not " +
+                "deleted from the server.\n\n" +
+                "To log in to an account again after switching, whether your current account or " +
+                "an existing account on $displayName, it must be linked (data link / account " +
+                "transfer). If your current account is not linked yet, cancel and link it first."
+        try {
+            AlertDialog.Builder(activity)
+                .setTitle("Switch server?")
+                .setMessage(message)
+                .setPositiveButton("Clear data and switch") { d, _ ->
+                    d.dismiss()
+                    listDialog.dismiss()
+                    ServerProfileStore.requestSwitch(activity, profileId)
+                }
+                .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+                .show()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerSwitch: cannot show the switch confirmation", t)
         }
     }
 

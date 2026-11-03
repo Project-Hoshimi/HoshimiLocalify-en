@@ -17,6 +17,8 @@ import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * A server the player can point the game at.
@@ -78,6 +80,13 @@ object ServerProfileStore {
     private const val FILE_ACTIVE = "active.json"
     private const val FILE_PENDING = "pending.json"
 
+    /**
+     * Marker written right before a switch relaunch. Native runs the game's own Delete Data
+     * routine; if that does not happen, the next start deletes the live account files instead.
+     */
+    private const val FILE_CLEAR_PENDING = "clear-pending"
+    private const val CLEAR_TIMEOUT_MS = 3000L
+
     private const val PROFILE_DIR_NAME = "hoshimi-profiles"
     private const val ACCOUNT_DIR_NAME = "account"
     private const val ACCOUNT_NEW_DIR_NAME = "account.new"
@@ -114,6 +123,15 @@ object ServerProfileStore {
 
     /** Synchronises this object's file access; every entry point may run on any thread. */
     private val lock = Any()
+
+    /** Coordinates the requestSwitch background wait with the native completion callback. */
+    private val clearLock = Any()
+
+    @Volatile
+    private var clearLatch: CountDownLatch? = null
+
+    @Volatile
+    private var clearResult: Boolean? = null
 
     /**
      * True when the companion module app answered `requestConfig` with private server enabled. The
@@ -810,15 +828,64 @@ object ServerProfileStore {
     // ---- switching -----------------------------------------------------------------------
 
     /**
-     * Arms the relaunch and kills the process; the next start consumes `pending.json` before
-     * anything else runs. A restart is unavoidable because UnityTLS caches its trust anchors.
+     * Switches the active server by clearing the local account data instead of swapping it.
+     *
+     * `active.json` and the `clear-pending` marker are written first, then native is asked to run
+     * the game's own Delete Data routine (`SolisInitializer.ClearUserData`). A background thread
+     * waits up to [CLEAR_TIMEOUT_MS] for the result, then the process is relaunched on the UI
+     * thread regardless of success. If native never ran, the marker makes the next start wipe the
+     * account files before the game code runs.
      */
     fun requestSwitch(activity: Activity, targetId: String) {
         val filesDir = activity.filesDir
-        if (!writePendingTarget(filesDir, targetId)) {
-            Log.e(TAG, "ServerProfileStore: cannot journal the switch to $targetId; not relaunching")
+        try {
+            writeActiveId(filesDir, targetId)
+            writeClearMarker(filesDir, targetId)
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot prepare the switch to $targetId; not relaunching", t)
             return
         }
+
+        val latch = CountDownLatch(1)
+        synchronized(clearLock) {
+            clearLatch = latch
+            clearResult = null
+        }
+        try {
+            HoshimiHookMain.requestClearUserData()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: cannot request the native account wipe", t)
+            onClearUserDataDone(false)
+        }
+
+        // The wait must not block the UI thread; the relaunch itself runs there.
+        Thread {
+            val completed = try {
+                latch.await(CLEAR_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }
+            catch (t: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            val success = completed && clearResult == true
+            if (success) {
+                Log.i(TAG, "ServerProfileStore: native cleared local account data for $targetId")
+            }
+            else {
+                Log.w(
+                    TAG,
+                    "ServerProfileStore: native account wipe for $targetId did not complete " +
+                            "(timeout or failure); the next start will wipe the files"
+                )
+            }
+            activity.runOnUiThread { relaunch(activity) }
+        }.start()
+    }
+
+    /** Arms the relaunch and kills the process, on the UI thread. */
+    private fun relaunch(activity: Activity) {
         val relaunch = try {
             activity.packageManager.getLaunchIntentForPackage(activity.packageName)
         }
@@ -828,7 +895,6 @@ object ServerProfileStore {
         }
         if (relaunch == null) {
             Log.e(TAG, "ServerProfileStore: no launch intent for ${activity.packageName}; aborting switch")
-            deletePending(filesDir)
             return
         }
         try {
@@ -848,7 +914,6 @@ object ServerProfileStore {
         }
         catch (t: Throwable) {
             Log.e(TAG, "ServerProfileStore: cannot schedule the relaunch", t)
-            deletePending(filesDir)
             return
         }
         try {
@@ -858,6 +923,56 @@ object ServerProfileStore {
             Log.w(TAG, "ServerProfileStore: finishAffinity failed", t)
         }
         Process.killProcess(Process.myPid())
+    }
+
+    private fun writeClearMarker(filesDir: File, targetId: String) {
+        writeAtomically(File(profilesDir(filesDir), FILE_CLEAR_PENDING), targetId)
+        Log.i(TAG, "ServerProfileStore: clear-pending marker written for $targetId")
+    }
+
+    /** Called from [HoshimiHookMain.onClearUserDataDone] on the native callback thread. */
+    fun onClearUserDataDone(success: Boolean) {
+        synchronized(clearLock) {
+            clearResult = success
+            clearLatch?.countDown()
+        }
+    }
+
+    /**
+     * Wipes the live account files when a previous switch left the `clear-pending` marker, then
+     * removes the marker. Runs in the main process before the game (and Firebase) reads them.
+     */
+    fun consumeClearPending(dataDir: File) {
+        val filesDir = File(dataDir, "files")
+        synchronized(lock) {
+            val marker = File(profilesDir(filesDir), FILE_CLEAR_PENDING)
+            if (!marker.isFile) return
+            val targetId = try {
+                marker.readText().trim()
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "ServerProfileStore: cannot read clear-pending", t)
+                ""
+            }
+            try {
+                for (entry in accountEntries(dataDir)) deleteRecursively(entry)
+                Log.i(
+                    TAG,
+                    "ServerProfileStore: cleared local account data after server switch to $targetId"
+                )
+            }
+            catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot clear the local account data", t)
+            }
+            try {
+                if (!marker.delete()) {
+                    Log.w(TAG, "ServerProfileStore: cannot delete ${marker.absolutePath}")
+                }
+            }
+            catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot delete clear-pending", t)
+            }
+        }
     }
 
     // ---- URL helpers ---------------------------------------------------------------------

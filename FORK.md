@@ -106,12 +106,13 @@ pick the server inside the game. The module app is not required: this works in s
 (LSPatch-embedded module, app not installed).
 
 - **Switch server button.** `ServerSwitchOverlay.kt` adds a small native `Button` to the game
-  activity's content view. Native code (`Hook.cpp`, `ProbeTextComponent`) reports the first
-  segment of the current UI text component path through the JNI callback
-  `HoshimiHookMain.onScreenRootChanged`; the button is visible while that root contains
-  `TITLE_SCREEN_ROOT_MARKER` (`Title`) and hidden everywhere else. The marker is a single
-  constant and is tuned against the emulator; the detected root is logged as
-  `ServerSwitch: screen root -> <name>`.
+  activity's content view. Native hooks on `Solis.Title.TitlePresenter` (`Start`,
+  `MoveOutGameAsync`, `OnDestroy` in `Hook.cpp`) report title-screen visibility through
+  `HoshimiHookMain.onTitleScreenChanged`, so the button appears as soon as the title presenter
+  starts even when the text probe is not active yet. The older screen-root probe
+  (`ProbeTextComponent` -> `HoshimiHookMain.onScreenRootChanged`, visible while the root contains
+  `TITLE_SCREEN_ROOT_MARKER` (`Title`)) stays as a fallback. Missing TitlePresenter methods only
+  log a warning.
 - **Picker.** `ServerPromptDialog.kt` builds a plain `AlertDialog` in code (no layout
   resources): "Official server", every saved private profile, and "Add private server…". It is
   shown once configuration resolution finished (the module app answered or the standalone
@@ -124,18 +125,20 @@ pick the server inside the game. The module app is not required: this works in s
   the bootstrap request only, the returned CA must have signed the presented leaf certificate,
   and the player confirms the CA fingerprint unless `#sha256=` matched. Plain `http://` always
   requires the confirmation.
-- **Account separation.** Each server has its own login, and the refresh token is bound to the
-  server, so switching swaps whole account file sets instead of sharing one. This means a
-  restart: `pending.json` is written, the launch intent is scheduled 500 ms later, and the
-  process is killed. On the next start `HoshimiHookMain.handleLoadPackage` (before Firebase's
-  ContentProvider runs, main process only) runs a journaled swap in `ServerProfileStore.kt`:
-  `begin` → `stashing` (live files move into `<from>/account.new/`) → `stashed` (atomically
-  replace `<from>/account`) → `restoring` (copy the target's stash back, never consume it, then
-  write `active.json`). An interrupted swap retries from the persisted phase on the next launch;
-  after 3 attempts, or on an error past attempt 3, it aborts, restores the source account and
-  leaves `active.json` unchanged. Only `shared_prefs/com.google.firebase.auth.api.Store.*.xml`,
-  `shared_prefs/game.qualiarts.idolypride.v2.playerprefs.xml` and `files/octo/user/` move;
-  asset and master caches under `files/octo/v1` and `files/octo/pdb` stay shared.
+- **Switching clears the local account.** Each server has its own login and the refresh token is
+  bound to the server, so a switch wipes the account files instead of swapping them. The player
+  confirms a warning first (the picker's confirmation dialog); then `ServerProfileStore.kt`
+  writes `active.json`, writes a `clear-pending` marker, and asks native code to run the game's
+  own Delete Data routine (`Solis.Common.SolisInitializer.ClearUserData`), invoked on the Unity
+  main thread from the `EndCameraRendering` hook. The process is relaunched after the call
+  completes or after a 3 s timeout. If the native call never ran, the next start deletes the
+  live account files before Firebase's ContentProvider runs (main process only):
+  `shared_prefs/com.google.firebase.auth.api.Store.*.xml`,
+  `shared_prefs/game.qualiarts.idolypride.v2.playerprefs.xml` and `files/octo/user/`. Asset and
+  master caches under `files/octo/v1` and `files/octo/pdb` stay shared. Accounts must be linked
+  (data link / account transfer) to log in again after a switch; the account itself is not
+  deleted from the server. Old `<profileId>/account*` stash directories are left untouched, and
+  a legacy `pending.json` is still finished or aborted on start.
 
 Files under `<game dataDir>/files/hoshimi-profiles/` (managed by `ServerProfileStore.kt`):
 
@@ -143,8 +146,9 @@ Files under `<game dataDir>/files/hoshimi-profiles/` (managed by `ServerProfileS
 |---|---|
 | `profiles.json` | `{id, kind: "official"\|"private", url, caPem, caSha256, label}`; `official` always exists |
 | `active.json` | `{activeId}` |
-| `pending.json` | `{targetId, fromId, phase, attempts}`, written while a switch is in flight or retrying |
-| `<profileId>/account/` | that server's account files (private profiles only) |
+| `clear-pending` | target profile id, written before a switch and consumed on the next start |
+| `pending.json` | legacy swap journal `{targetId, fromId, phase, attempts}`; only read now |
+| `<profileId>/account/` | legacy per-server stash, no longer written |
 
 A private profile id is `private-` plus the first 8 hex chars of the SHA-1 of the normalized URL
 (lowercase scheme and host, no trailing slash).

@@ -23,6 +23,14 @@ namespace HoshimiLocal::Log {
     // Latest detected UI screen root, consumed by the Kotlin side through ScreenRootLoop.
     void SetScreenRoot(const std::string& root);
     void ScreenRootLoop(JNIEnv *env, jclass clazz);
+
+    // TitlePresenter visibility reported by the native hooks, consumed through TitleScreenLoop.
+    void SetTitleScreenVisible(bool visible);
+    void TitleScreenLoop(JNIEnv *env, jclass clazz);
+
+    // Result of a requested native account wipe, consumed through ClearUserDataLoop.
+    void SetClearUserDataResult(bool success);
+    void ClearUserDataLoop(JNIEnv *env, jclass clazz);
 }
 
 #endif //IDOLYPRIDE_LOCALIFY_LOG_H

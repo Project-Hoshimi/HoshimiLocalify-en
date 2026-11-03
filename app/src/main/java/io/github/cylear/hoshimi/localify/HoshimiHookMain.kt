@@ -86,7 +86,10 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 val dir = File(dataDir)
                 ServerProfileStore.migrateLegacyCacheIfPresent(dir)
                 if (mainProcess) {
+                    // Only a legacy journal left by an older build is consumed; new switches never
+                    // create pending.json. A clear-pending marker wipes the account files instead.
                     ServerProfileStore.swapPendingAccount(dir)
+                    ServerProfileStore.consumeClearPending(dir)
                 }
             }
         }
@@ -698,6 +701,10 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         @JvmStatic
         external fun loadConfig(configJsonStr: String)
 
+        /** Asks native to run the game's own Delete Data routine on the Unity main thread. */
+        @JvmStatic
+        external fun requestClearUserData()
+
         /** Game JWT captured from the login response; empty until the first login. */
         @JvmStatic
         external fun getGameAuthToken(): String
@@ -735,6 +742,18 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         @JvmStatic
         fun onScreenRootChanged(root: String) {
             ServerSwitchOverlay.onScreenRootChanged(root)
+        }
+
+        /** Result of [requestClearUserData], delivered from the native callback loop. */
+        @JvmStatic
+        fun onClearUserDataDone(success: Boolean) {
+            ServerProfileStore.onClearUserDataDone(success)
+        }
+
+        /** Reported from the native `TitlePresenter` hooks; drives the switch-button visibility. */
+        @JvmStatic
+        fun onTitleScreenChanged(visible: Boolean) {
+            ServerSwitchOverlay.onTitleScreenChanged(visible)
         }
     }
 
