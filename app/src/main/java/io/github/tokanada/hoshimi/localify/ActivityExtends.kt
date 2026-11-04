@@ -1,0 +1,215 @@
+package io.github.tokanada.hoshimi.localify
+
+import android.app.Activity
+import android.content.Intent
+import android.util.Log
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import io.github.tokanada.hoshimi.localify.hookUtils.FilesChecker
+import io.github.tokanada.hoshimi.localify.mainUtils.json
+import io.github.tokanada.hoshimi.localify.models.IdolyprideConfig
+import io.github.tokanada.hoshimi.localify.models.ProgramConfig
+import io.github.tokanada.hoshimi.localify.models.ProgramConfigSerializer
+import kotlinx.serialization.SerializationException
+import java.io.File
+
+
+interface IHasConfigItems {
+    var config: IdolyprideConfig
+    var programConfig: ProgramConfig
+
+    fun saveConfig() {}  // do nothing
+}
+
+interface IConfigurableActivity<T : Activity> : IHasConfigItems
+
+fun normalizeSuggestedServerUrl(value: String): String = value.trim().trimEnd('/')
+
+fun appendSuggestedServerUrl(urls: List<String>, raw: String): List<String> {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return urls
+    val normalized = normalizeSuggestedServerUrl(trimmed)
+    if (urls.any { normalizeSuggestedServerUrl(it) == normalized }) return urls
+    return urls + trimmed
+}
+
+
+fun <T> T.getConfigContent(): String where T : Activity {
+    val configFile = File(filesDir, "ipr-config.json")
+    return if (configFile.exists()) {
+        configFile.readText()
+    } else {
+        Toast.makeText(this, "First launch detected, initialising configuration file...", Toast.LENGTH_SHORT).show()
+        configFile.writeText("{}")
+        "{}"
+    }
+}
+
+fun <T> T.getProgramConfigContent(
+    excludes: List<String> = emptyList(),
+    origProgramConfig: ProgramConfig? = null
+): String where T : Activity {
+    val configFile = File(filesDir, "localify-config.json")
+    if (excludes.isEmpty()) {
+        return if (configFile.exists()) {
+            configFile.readText()
+        } else {
+            "{}"
+        }
+    } else {
+        return if (origProgramConfig == null) {
+            if (configFile.exists()) {
+                val parsedConfig = json.decodeFromString<ProgramConfig>(configFile.readText())
+                json.encodeToString(ProgramConfigSerializer(excludes), parsedConfig)
+            } else {
+                "{}"
+            }
+        } else {
+            json.encodeToString(ProgramConfigSerializer(excludes), origProgramConfig)
+        }
+    }
+}
+
+fun <T> T.loadConfig() where T : Activity, T : IHasConfigItems {
+    val configStr = getConfigContent()
+    config = try {
+        json.decodeFromString<IdolyprideConfig>(configStr)
+    } catch (e: SerializationException) {
+        Toast.makeText(this, "Configuration file error: $e", Toast.LENGTH_SHORT).show()
+        IdolyprideConfig()
+    }
+
+    if (config.privateServerUrl.isNotBlank()) {
+        val migratedUrl = config.privateServerUrl.trim()
+        config.suggestedServerUrls = appendSuggestedServerUrl(config.suggestedServerUrls, migratedUrl)
+        config.privateServerEnabled = false
+        config.privateServerUrl = ""
+        config.privateServerCaPem = ""
+        Log.i(TAG, "PrivateServerPage: migrated $migratedUrl into suggested servers")
+        // Persist here: the activity that answers the game's config request has a no-op
+        // saveConfig() and forwards the file verbatim, so the migration must reach disk.
+        try {
+            File(filesDir, "ipr-config.json").writeText(json.encodeToString(IdolyprideConfig.serializer(), config))
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "PrivateServerPage: cannot persist the migrated config", t)
+        }
+        saveConfig()
+    }
+
+    val programConfigStr = getProgramConfigContent()
+    programConfig = try {
+        json.decodeFromString<ProgramConfig>(programConfigStr)
+    } catch (e: SerializationException) {
+        ProgramConfig()
+    }
+    if (programConfig.useAPIAssetsURL.isEmpty()) {
+        programConfig.useAPIAssetsURL = getString(R.string.default_assets_check_api)
+    }
+}
+
+fun <T> T.updateCurrentResourceVersionForGameStart() where T : Activity, T : IHasConfigItems {
+    val version = when {
+        programConfig.cleanLocalAssets -> ""
+        programConfig.useAPIAssets -> {
+            val versionFile = File(filesDir, "remote_files/version.txt")
+            if (versionFile.exists()) versionFile.readText().trim() else ""
+        }
+        programConfig.useBuiltInAssets -> {
+            try {
+                assets.open("${FilesChecker.localizationFilesDir}/version.txt").use {
+                    FilesChecker.convertToString(it).trim()
+                }
+            }
+            catch (_: Exception) {
+                ""
+            }
+        }
+        else -> programConfig.currentResourceVersion
+    }
+
+    programConfig.currentResourceVersion = version
+    File(filesDir, "localify-config.json").writeText(json.encodeToString(ProgramConfig.serializer(), programConfig))
+    if (this is MainActivity) {
+        programConfig.p = false
+        programConfigViewModel.configState.value = programConfig.copy(p = true)
+    }
+}
+
+fun <T> T.onClickStartGame(requestedPackage: String? = null) where T : Activity, T : IHasConfigItems {
+    val gamePackageName = requestedPackage?.takeIf { it in TargetGamePackages.all }
+        ?: TargetGamePackages.findInstalled(this)
+    if (gamePackageName == null) {
+        Toast.makeText(this, "Game package not found.", Toast.LENGTH_SHORT).show()
+        return
+    }
+
+    val lastStartPluginVersionFile = File(filesDir, "lastStartPluginVersion.txt")
+    val lastStartPluginVersion = if (lastStartPluginVersionFile.exists()) {
+        lastStartPluginVersionFile.readText()
+    }
+    else {
+        "null"
+    }
+    val packInfo = packageManager.getPackageInfo(packageName, 0)
+    val version = packInfo.versionName
+    val versionCode = packInfo.longVersionCode
+    val currentPluginVersion = "$version ($versionCode)"
+    if (lastStartPluginVersion != currentPluginVersion) {  // Plugin version updated, force check resource updates
+        lastStartPluginVersionFile.writeText(currentPluginVersion)
+        programConfig.useBuiltInAssets = true
+        
+        // Force delete version.txt so FilesChecker detects 0.0 and extracts the new APK assets
+        val pluginFilesDir = File(filesDir, "hoshimi-local")
+        val versionFile = File(pluginFilesDir, "version.txt")
+        if (versionFile.exists()) {
+            versionFile.delete()
+        }
+    }
+    updateCurrentResourceVersionForGameStart()
+
+    val intent = Intent().apply {
+        setClassName(
+            gamePackageName,
+            "com.google.firebase.MessagingUnityPlayerActivity"
+        )
+        putExtra("iprData", getConfigContent())
+        putExtra(
+            "localData",
+            getProgramConfigContent(listOf("localAPIAssetsVersion",
+                "currentResourceVersion", "p"), programConfig)
+        )
+        putExtra("lVerName", version)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+
+    val updateAPIFile = File(filesDir, "remote_files/remote.zip")
+    val targetFile = if (programConfig.useAPIAssets && updateAPIFile.exists()) {
+        updateAPIFile
+    }
+    else {
+        null
+    }
+
+    if (targetFile != null) {
+        val dirUri = FileProvider.getUriForFile(
+            this,
+            "${BuildConfig.APPLICATION_ID}.fileprovider",
+            File(targetFile.absolutePath)
+        )
+        // intent.setDataAndType(dirUri, "resource/file")
+
+        TargetGamePackages.all.forEach {
+            grantUriPermission(
+                it,
+                dirUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        }
+        intent.putExtra("resource_file", dirUri)
+        // intent.clipData = ClipData.newRawUri("resource_file", dirUri)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+    }
+
+    startActivity(intent)
+}

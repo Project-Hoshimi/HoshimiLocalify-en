@@ -1,0 +1,779 @@
+package io.github.tokanada.hoshimi.localify
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.AlertDialog
+import android.app.AndroidAppHelper
+import android.content.Context
+import android.content.Intent
+import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.widget.Toast
+import com.bytedance.shadowhook.ShadowHook
+import com.bytedance.shadowhook.ShadowHook.ConfigBuilder
+import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.IXposedHookZygoteInit
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
+import android.content.res.XModuleResources
+import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.tokanada.hoshimi.localify.hookUtils.FilesChecker
+import io.github.tokanada.hoshimi.localify.mainUtils.RemoteAPIFilesChecker
+import io.github.tokanada.hoshimi.localify.models.IdolyprideConfig
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.File
+import java.util.Locale
+import kotlin.system.measureTimeMillis
+import io.github.tokanada.hoshimi.localify.hookUtils.FileHotUpdater
+import io.github.tokanada.hoshimi.localify.hookUtils.FilesChecker.localizationFilesDir
+import io.github.tokanada.hoshimi.localify.mainUtils.json
+import io.github.tokanada.hoshimi.localify.models.NativeInitProgress
+import io.github.tokanada.hoshimi.localify.models.ProgramConfig
+import io.github.tokanada.hoshimi.localify.ui.game_attach.InitProgressUI
+
+val TAG = "HoshimiLocalify"
+
+class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
+    private lateinit var modulePath: String
+    private var nativeLibLoadSuccess: Boolean
+    private var alreadyInitialized = false
+    private val nativeLibName = "HoshimiLocalify"
+
+    private var iprDataInited = false
+
+    private var getConfigError: Exception? = null
+    private var externalFilesChecked: Boolean = false
+    private var gameActivity: Activity? = null
+
+    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+//        if (lpparam.packageName == "io.github.tokanada.hoshimi.localify") {
+//            XposedHelpers.findAndHookMethod(
+//                "io.github.tokanada.hoshimi.localify.MainActivity",
+//                lpparam.classLoader,
+//                "showToast",
+//                String::class.java,
+//                object : XC_MethodHook() {
+//                    override fun beforeHookedMethod(param: MethodHookParam) {
+//                        Log.d(TAG, "beforeHookedMethod hooked: ${param.args}")
+//                    }
+//                }
+//            )
+//        }
+
+        if (lpparam.packageName !in TargetGamePackages.all) {
+            return
+        }
+
+        mainProcess = lpparam.processName == lpparam.packageName
+
+        // In-game server selection state lives in the game's own sandbox. A pending switch is
+        // consumed here, before Firebase's ContentProvider in the new process reads its auth store.
+        // Only the main process may touch the shared account files.
+        try {
+            val dataDir = lpparam.appInfo?.dataDir
+            if (dataDir != null) {
+                val dir = File(dataDir)
+                ServerProfileStore.migrateLegacyCacheIfPresent(dir)
+                if (mainProcess) {
+                    // Only a legacy journal left by an older build is consumed; new switches never
+                    // create pending.json. A clear-pending marker wipes the account files instead.
+                    ServerProfileStore.swapPendingAccount(dir)
+                    ServerProfileStore.consumeClearPending(dir)
+                }
+            }
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: early server switch handling failed", t)
+        }
+
+        // Installed before the process runs any game code: libunity.so resolves the UnityTLS root
+        // list over JNI (TrustManagerFactory.getTrustManagers -> getAcceptedIssuers) and caches it,
+        // so the hooks must exist before the Unity player starts networking.
+        PrivateServerTrust.install(lpparam.classLoader)
+
+        // Local notifications for idol messages/calls (the official game used FCM pushes).
+        NarrativeNotifier.install(lpparam.classLoader)
+
+        if (nativeLibLoadSuccess) {
+            NotificationTranslationHook.install(lpparam.packageName)
+        }
+
+        XposedHelpers.findAndHookMethod(
+            "android.app.Activity",
+            lpparam.classLoader,
+            "dispatchKeyEvent",
+            KeyEvent::class.java,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val keyEvent = param.args[0] as KeyEvent
+                    val keyCode = keyEvent.keyCode
+                    val action = keyEvent.action
+                    // Log.d(TAG, "Key event: keyCode=$keyCode, action=$action")
+                    keyboardEvent(keyCode, action)
+                }
+            }
+        )
+
+        XposedHelpers.findAndHookMethod(
+            "android.app.Activity",
+            lpparam.classLoader,
+            "dispatchGenericMotionEvent",
+            MotionEvent::class.java,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val motionEvent = param.args[0] as MotionEvent
+                    val action = motionEvent.action
+
+                    // Left stick X and Y axis
+                    val leftStickX = motionEvent.getAxisValue(MotionEvent.AXIS_X)
+                    val leftStickY = motionEvent.getAxisValue(MotionEvent.AXIS_Y)
+
+                    // Right stick X and Y axis
+                    val rightStickX = motionEvent.getAxisValue(MotionEvent.AXIS_Z)
+                    val rightStickY = motionEvent.getAxisValue(MotionEvent.AXIS_RZ)
+
+                    // Left trigger
+                    val leftTrigger = motionEvent.getAxisValue(MotionEvent.AXIS_LTRIGGER)
+
+                    // Right trigger
+                    val rightTrigger = motionEvent.getAxisValue(MotionEvent.AXIS_RTRIGGER)
+
+                    // D-Pad
+                    val hatX = motionEvent.getAxisValue(MotionEvent.AXIS_HAT_X)
+                    val hatY = motionEvent.getAxisValue(MotionEvent.AXIS_HAT_Y)
+
+                    // Handle stick and trigger events
+                    joystickEvent(
+                        action,
+                        leftStickX,
+                        leftStickY,
+                        rightStickX,
+                        rightStickY,
+                        leftTrigger,
+                        rightTrigger,
+                        hatX,
+                        hatY
+                    )
+                }
+            }
+        )
+
+        val appActivityClass = XposedHelpers.findClass("android.app.Activity", lpparam.classLoader)
+        XposedBridge.hookAllMethods(appActivityClass, "onStart", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                super.beforeHookedMethod(param)
+                Log.d(TAG, "onStart")
+                val currActivity = param.thisObject as Activity
+                gameActivity = currActivity
+                activityResumed = false
+                if (getConfigError != null) {
+                    showGetConfigFailed(currActivity)
+                }
+                else {
+                    initIprConfig(currActivity)
+                }
+            }
+        })
+
+        XposedBridge.hookAllMethods(appActivityClass, "onResume", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                Log.d(TAG, "onResume")
+                val currActivity = param.thisObject as Activity
+                gameActivity = currActivity
+                activityResumed = true
+                if (getConfigError != null) {
+                    showGetConfigFailed(currActivity)
+                }
+                else {
+                    initIprConfig(currActivity)
+                }
+                try {
+                    ServerSwitchOverlay.attach(currActivity)
+                    maybeShowFirstLaunch(currActivity)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerSwitch: cannot prepare the server UI", t)
+                }
+            }
+        })
+
+        val cls = lpparam.classLoader.loadClass("com.unity3d.player.UnityPlayer")
+        XposedHelpers.findAndHookMethod(
+            cls,
+            "loadNative",
+            String::class.java,
+            object : XC_MethodHook() {
+                @SuppressLint("UnsafeDynamicallyLoadedCode")
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    super.afterHookedMethod(param)
+
+                    Log.i(TAG, "UnityPlayer.loadNative")
+
+                    if (alreadyInitialized) {
+                        return
+                    }
+
+                    val app = AndroidAppHelper.currentApplication()
+                    if (nativeLibLoadSuccess) {
+                        showToast("lib$nativeLibName.so loaded.")
+                    }
+                    else {
+                        showToast("Load native library lib$nativeLibName.so failed.")
+                        return
+                    }
+
+                    if (!iprDataInited) {
+                        requestConfig(app.applicationContext)
+                    }
+
+                    FilesChecker.initDir(app.filesDir, modulePath)
+                    initHook(
+                        "${app.applicationInfo.nativeLibraryDir}/libil2cpp.so",
+                        File(
+                            app.filesDir.absolutePath,
+                            FilesChecker.localizationFilesDir
+                        ).absolutePath
+                    )
+
+                    alreadyInitialized = true
+                }
+            })
+
+        startLoop()
+    }
+
+    @OptIn(DelicateCoroutinesApi::class)
+    private fun startLoop() {
+        GlobalScope.launch {
+            val interval = 1000L / 30
+            var lastFrameStartInit = NativeInitProgress.startInit
+            val initProgressUI = InitProgressUI()
+
+            while (isActive) {
+                val timeTaken = measureTimeMillis {
+                    val returnValue = pluginCallbackLooper()  // plugin main thread loop
+                    if (returnValue == 9) {
+                        NativeInitProgress.startInit = true
+                    }
+
+                    if (NativeInitProgress.startInit) {  // if init, update data
+                        NativeInitProgress.pluginInitProgressLooper(NativeInitProgress)
+                        gameActivity?.let { initProgressUI.updateData(it) }
+                    }
+
+                    if ((gameActivity != null) && (lastFrameStartInit != NativeInitProgress.startInit)) {  // change status
+                        if (NativeInitProgress.startInit) {
+                            initProgressUI.createView(gameActivity!!)
+                        }
+                        else {
+                            initProgressUI.finishLoad(gameActivity!!)
+                        }
+                    }
+                    lastFrameStartInit = NativeInitProgress.startInit
+                }
+                delay(interval - timeTaken)
+            }
+        }
+    }
+
+    fun initIprConfig(activity: Activity) {
+        val intent = activity.intent
+        val iprData = intent.getStringExtra("iprData")
+        val programData = intent.getStringExtra("localData")
+        if (iprData != null) {
+            val readVersion = intent.getStringExtra("lVerName")
+            checkPluginVersion(activity, readVersion)
+
+            iprDataInited = true
+            val initConfig = try {
+                json.decodeFromString<IdolyprideConfig>(iprData)
+            }
+            catch (e: Exception) {
+                null
+            }
+            // The module app only suggests servers; the in-game picker owns the active one.
+            // Only the game's main process maintains the shared suggestion file.
+            if (initConfig != null && mainProcess) {
+                ServerProfileStore.updateSuggestedServers(activity.filesDir, initConfig.suggestedServerUrls)
+            }
+            // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
+            // configuration is seen (usually a no-op, the launch intent already delivered it).
+            // A malformed payload decodes to null and is ignored by the trust layer.
+            if (initConfig != null) {
+                try {
+                    // A config that enables a private server becomes a profile on first sight, so a
+                    // later switch can come back to it with the same account.
+                    ServerProfileStore.migrateFromAppConfig(activity.filesDir, initConfig)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot migrate the app configuration", t)
+                }
+            }
+            // The app's private-server setting wins only when it enables one; otherwise the
+            // in-game active profile decides, and native must see that same decision.
+            var effectiveIprData = iprData
+            // "standalone-*" tells the trust layer this config is the active profile, not an
+            // app configuration that enables the private server.
+            var observeSource = "iprData"
+            if (initConfig != null && !initConfig.privateServerEnabled) {
+                try {
+                    ServerProfileStore.applyActiveProfile(initConfig, activity.filesDir)
+                    effectiveIprData = json.encodeToString(IdolyprideConfig.serializer(), initConfig)
+                    observeSource = "standalone-profile-over-app"
+                    Log.i(TAG, "ServerProfileStore: native config follows the active profile " +
+                            "(private=${initConfig.privateServerEnabled})")
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot apply the active profile to the app config", t)
+                }
+            }
+            try {
+                PrivateServerTrust.observeConfig(initConfig, observeSource)
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA from iprData", t)
+            }
+            val programConfig = try {
+                if (programData == null) {
+                    ProgramConfig()
+                } else {
+                    json.decodeFromString<ProgramConfig>(programData)
+                }
+            }
+            catch (e: Exception) {
+                null
+            }
+
+            // Clean up local files
+            if (programConfig?.cleanLocalAssets == true) {
+                FilesChecker.cleanAssets()
+            }
+
+            // Check files version and assets version and update
+            if (programConfig?.useBuiltInAssets == true) {
+                FilesChecker.initAndCheck(activity.filesDir, modulePath)
+            }
+
+            // Force export assets files
+            if (initConfig?.forceExportResource == true) {
+                FilesChecker.updateFiles()
+            }
+
+            // Use hot update file
+            if (programConfig?.useAPIAssets == true) {
+                // val dataUri = intent.data
+                val dataUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra("resource_file", Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>("resource_file")
+                }
+
+                if (dataUri != null) {
+                    if (!externalFilesChecked) {
+                        externalFilesChecked = true
+                        // Log.d(TAG, "dataUri: $dataUri")
+                        FileHotUpdater.updateFilesFromZip(activity, dataUri, activity.filesDir,
+                            false)
+        }
+                }
+                else if (programConfig.useAPIAssets) {
+                    if (!File(activity.filesDir, localizationFilesDir).exists() &&
+                        (initConfig?.forceExportResource == false)) {
+                        // Use API resources without checking built-in; if API resources are invalid and no plugin data in game, release built-in data
+                        FilesChecker.initAndCheck(activity.filesDir, modulePath)
+                    }
+                }
+            }
+
+            loadConfig(effectiveIprData)
+            if (initConfig != null) NotificationLocalizer.updateConfig(activity, initConfig)
+            Log.d(TAG, "iprData: $iprData")
+            checkTranslationUpdate(activity)
+            afterConfigResolved(activity)
+        }
+    }
+
+    private fun checkTranslationUpdate(activity: Activity) {
+        val preferences = activity.getSharedPreferences(
+            "hoshimi_local_update_check",
+            Context.MODE_PRIVATE
+        )
+        val currentTime = System.currentTimeMillis()
+        val lastCheckTime = preferences.getLong("last_check_time", 0L)
+        if (currentTime - lastCheckTime < 30 * 60 * 1000L) return
+
+        val installedVersion = FilesChecker.getInstalledVersion().trim()
+        if (installedVersion.isEmpty() || installedVersion == "0.0") return
+
+        val apiUrl = runCatching {
+            XModuleResources.createInstance(modulePath, null)
+                .getString(R.string.default_assets_check_api)
+        }.getOrElse {
+            Log.e(TAG, "Failed to load translation update API URL.", it)
+            return
+        }
+
+        preferences.edit().putLong("last_check_time", currentTime).apply()
+        RemoteAPIFilesChecker.checkUpdateLocalAssets(
+            activity.applicationContext,
+            apiUrl,
+            onFailed = { _, reason ->
+                Log.w(TAG, "Translation update check failed: $reason")
+            },
+            onResult = { release, _ ->
+                val latestVersion = release.tag_name.trim()
+                Log.i(TAG, "Translation update check: installed=$installedVersion latest=$latestVersion")
+                if (latestVersion.isNotEmpty() && latestVersion != installedVersion) {
+                    activity.runOnUiThread {
+                        showTranslationUpdateDialog(activity, installedVersion, latestVersion)
+                    }
+                }
+            }
+        )
+    }
+
+    private fun showTranslationUpdateDialog(activity: Activity, installedVersion: String, latestVersion: String) {
+        val lang = getCurrentLanguage(activity)
+        val title = when (lang) {
+            "ko" -> "번역 업데이트 알림"
+            "zh" -> "翻译更新提示"
+            else -> "Translation Update"
+        }
+        val message = when (lang) {
+            "ko" -> "신규 번역 데이터가 있습니다.\n\n현재 버전: $installedVersion\n최신 버전: $latestVersion\n\nHoshimi Localify 앱에서 'API를 통해 리소스 업데이트 확인' 메뉴를 통해 업데이트를 실행해 주세요."
+            "zh" -> "检测到新版本的翻译数据。\n\n当前版本: $installedVersion\n最新版本: $latestVersion\n\n请在 Hoshimi Localify 应用中通过“通过 API 检查资源更新”菜单执行更新。"
+            else -> "New translation data is available.\n\nInstalled version: $installedVersion\nLatest version: $latestVersion\n\nPlease update via 'Check Resource Update From API' in the Hoshimi Localify app."
+        }
+        val okButton = when (lang) {
+            "ko" -> "확인"
+            "zh" -> "确定"
+            else -> "OK"
+        }
+
+        AlertDialog.Builder(activity)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton(okButton) { dialog, _ ->
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun initStandaloneConfig(context: Context) {
+        if (iprDataInited) return
+
+        iprDataInited = true
+        FilesChecker.initAndCheck(context.filesDir, modulePath)
+        val defaultConfig = IdolyprideConfig()
+        // No module app answered the config request, so the in-game server profile decides whether
+        // the private server is used (official by default).
+        try {
+            ServerProfileStore.applyActiveProfile(defaultConfig, context.filesDir)
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "ServerProfileStore: cannot read the active server profile", t)
+        }
+        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), defaultConfig))
+        // Arm the profile's CA (if any) for this process; an official profile clears it.
+        try {
+            PrivateServerTrust.observeConfig(defaultConfig, "standalone-profile")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA in standalone mode", t)
+        }
+        NotificationLocalizer.updateConfig(context, defaultConfig)
+        Log.i(TAG, "Loaded default configuration in standalone mode.")
+        afterConfigResolved(context as? Activity ?: gameActivity)
+    }
+
+    /**
+     * Latch for the first-launch picker: the prompt must wait until the app configuration was
+     * actually resolved, so it can see a profiled server chosen through the module app.
+     */
+    private fun afterConfigResolved(activity: Activity?) {
+        configResolved = true
+        val current = activity ?: gameActivity
+        if (current != null && activityResumed) {
+            maybeShowFirstLaunch(current)
+        }
+    }
+
+    private fun maybeShowFirstLaunch(activity: Activity) {
+        if (!mainProcess || !configResolved || firstLaunchPromptHandled) return
+        try {
+            if (ServerProfileStore.appManagedPrivateServer) return
+            if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
+            firstLaunchPromptHandled = true
+            activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    // Let the next resumed activity try again instead of losing the prompt.
+                    firstLaunchPromptHandled = false
+                    return@runOnUiThread
+                }
+                ServerPromptDialog.maybeShowFirstLaunch(activity)
+            }
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "ServerSwitch: cannot schedule the first-launch server prompt", t)
+        }
+    }
+
+    private fun checkPluginVersion(activity: Activity, readVersion: String?) {
+        val buildVersionName = BuildConfig.VERSION_NAME
+        Log.i(TAG, "Checking Plugin Version: Build: $buildVersionName, Request: $readVersion")
+        if (readVersion?.trim() == buildVersionName.trim()) {
+            return
+        }
+
+        val builder = AlertDialog.Builder(activity)
+        val infoBuilder = AlertDialog.Builder(activity)
+        builder.setTitle("Warning")
+        builder.setCancelable(false)
+        builder.setMessage(when (getCurrentLanguage(activity)) {
+            "ko" -> "플러그인 버전이 일치하지 않습니다.\n내장된 버전: $buildVersionName\n요청된 버전: $readVersion\n\nLSPatch 통합 모드를 사용하여 게임을 다시 패치하지 않고 플러그인 본체만 업데이트했을 수 있습니다. $readVersion 버전의 플러그인으로 게임을 다시 패치하거나 로컬 모드를 사용해주세요."
+            "zh" -> "检测到插件版本不一致\n内置版本: $buildVersionName\n请求版本: $readVersion\n\n这可能是使用了 LSPatch 的集成模式，仅更新了插件本体，未重新修补游戏导致的。请使用 $readVersion 版本的插件重新修补或使用本地模式。"
+            else -> "Detected plugin version mismatch\nBuilt-in version: $buildVersionName\nRequested version: $readVersion\n\nThis may be caused by using the LSPatch integration mode, where only the plugin itself was updated without re-patching the game. Please re-patch the game using the $readVersion version of the plugin or use the local mode."
+        })
+
+        builder.setPositiveButton("OK") { dialog, _ ->
+            dialog.dismiss()
+        }
+
+        builder.setNegativeButton("Exit") { dialog, _ ->
+            dialog.dismiss()
+            activity.finishAffinity()
+        }
+
+        val dialog = builder.create()
+
+        infoBuilder.setOnCancelListener {
+            dialog.show()
+        }
+
+        dialog.show()
+    }
+
+    private fun showGetConfigFailedImpl(activity: Context, title: String, msg: String, infoButton: String, dlButton: String, okButton: String) {
+        if (getConfigError == null) return
+        val builder = AlertDialog.Builder(activity)
+        val infoBuilder = AlertDialog.Builder(activity)
+        val errConfigStr = getConfigError.toString()
+        builder.setTitle("$title: $errConfigStr")
+        getConfigError = null
+        builder.setCancelable(false)
+        builder.setMessage(msg)
+
+        builder.setPositiveButton(okButton) { dialog, _ ->
+            dialog.dismiss()
+        }
+
+        builder.setNegativeButton(dlButton) { dialog, _ ->
+            dialog.dismiss()
+            val webpage = Uri.parse("https://github.com/CyleAR/idolypride-addon")
+            val intent = Intent(Intent.ACTION_VIEW, webpage)
+            activity.startActivity(intent)
+        }
+
+        builder.setNeutralButton(infoButton) { _, _ ->
+            infoBuilder.setTitle("Error Info")
+            infoBuilder.setMessage(errConfigStr)
+            val infoDialog = infoBuilder.create()
+            infoDialog.show()
+        }
+
+        val dialog = builder.create()
+
+        infoBuilder.setOnCancelListener {
+            dialog.show()
+        }
+
+        dialog.show()
+    }
+
+    fun showGetConfigFailed(activity: Context) {
+        val langData = when (getCurrentLanguage(activity)) {
+            "ko" -> {
+                mapOf(
+                    "title" to "설정을 읽을 수 없습니다",
+                    "message" to "설정 로드에 실패하여 기본 설정이 사용됩니다.\n" +
+                            "LSPatch와 같은 도구의 통합 모드를 사용했거나 권한 부여를 거부했을 수 있습니다.\n" +
+                            "LSPatch와 같은 도구의 통합 모드를 사용했고 별도의 플러그인을 설치하지 않았다면 플러그인을 다운로드하세요.\n" +
+                            "플러그인 본체를 설치했는데도 이 오류가 표시되면 다른 앱을 실행할 권한을 허용하세요.",
+                    "infoButton" to "정보",
+                    "dlButton" to "다운로드",
+                    "okButton" to "확인"
+                )
+            }
+            "zh" -> {
+                mapOf(
+                    "title" to "无法读取设置",
+                    "message" to "配置读取失败，将使用默认配置。\n" +
+                            "可能是您使用了 LSPatch 等工具的集成模式，也有可能是您拒绝了拉起插件的权限。\n" +
+                            "若您使用了 LSPatch 等工具的集成模式，且没有单独安装插件本体，请下载插件本体。\n" +
+                            "若您安装了插件本体，却弹出这个错误，请允许本应用拉起其他应用。",
+                    "infoButton" to "详情",
+                    "dlButton" to "下载",
+                    "okButton" to "确定"
+                )
+            }
+            else -> {
+                mapOf(
+                    "title" to "Get Config Failed",
+                    "message" to "Configuration loading failed, the default configuration will be used.\n" +
+                            "This might be due to the use the integration mode of LSPatch, or possibly because you denied the permission to launch the plugin.\n" +
+                            "If you used the integration mode of LSPatch and did not install the plugin itself separately, please download the plugin.\n" +
+                            "If you have installed the plugin but still see this error, please allow this application to launch other applications.",
+                    "infoButton" to "Info",
+                    "dlButton" to "Download",
+                    "okButton" to "OK"
+                )
+            }
+        }
+        showGetConfigFailedImpl(activity, langData["title"]!!, langData["message"]!!, langData["infoButton"]!!,
+            langData["dlButton"]!!, langData["okButton"]!!)
+    }
+
+    private fun getCurrentLanguage(context: Context): String {
+        val locale: Locale = context.resources.configuration.locales.get(0)
+        return locale.language
+    }
+
+    fun requestConfig(activity: Context) {
+        try {
+            val intent = Intent().apply {
+                setClassName("io.github.tokanada.hoshimi.localify", "io.github.tokanada.hoshimi.localify.TranslucentActivity")
+                putExtra("iprData", "requestConfig")
+                putExtra("gamePackage", activity.packageName)
+                flags = FLAG_ACTIVITY_NEW_TASK
+            }
+            activity.startActivity(intent)
+        } catch (e: Exception) {
+            Log.i(TAG, "Config activity unavailable. Falling back to standalone mode.", e)
+            initStandaloneConfig(activity)
+        }
+
+    }
+
+    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
+        modulePath = startupParam.modulePath
+    }
+
+    companion object {
+        /**
+         * The first-launch server prompt waits for configuration resolution and is evaluated at
+         * most once per process. The account swap and the prompt only run in the main process.
+         */
+        @Volatile
+        private var mainProcess = false
+
+        @Volatile
+        private var configResolved = false
+
+        @Volatile
+        private var activityResumed = false
+
+        @Volatile
+        private var firstLaunchPromptHandled = false
+
+        @JvmStatic
+        external fun initHook(targetLibraryPath: String, localizationFilesDir: String)
+        @JvmStatic
+        external fun keyboardEvent(keyCode: Int, action: Int)
+        @JvmStatic
+        external fun joystickEvent(
+            action: Int,
+            leftStickX: Float,
+            leftStickY: Float,
+            rightStickX: Float,
+            rightStickY: Float,
+            leftTrigger: Float,
+            rightTrigger: Float,
+            hatX: Float,
+            hatY: Float
+        )
+        @JvmStatic
+        external fun loadConfig(configJsonStr: String)
+
+        /** Asks native to run the game's own Delete Data routine on the Unity main thread. */
+        @JvmStatic
+        external fun requestClearUserData()
+
+        /** Game JWT captured from the login response; empty until the first login. */
+        @JvmStatic
+        external fun getGameAuthToken(): String
+
+        // Toast fast switch content
+        private var toast: Toast? = null
+
+        @JvmStatic
+        fun showToast(message: String) {
+            val app = AndroidAppHelper.currentApplication()
+            val context = app?.applicationContext
+            if (context != null) {
+                val handler = Handler(Looper.getMainLooper())
+                handler.post {
+                    // Cancel previous Toast
+                    toast?.cancel()
+                    // Create new Toast
+                    toast = Toast.makeText(context, message, Toast.LENGTH_SHORT)
+                    // Show new Toast
+                    toast?.show()
+                }
+            }
+            else {
+                Log.e(TAG, "showToast: $message failed: applicationContext is null")
+            }
+        }
+
+        @JvmStatic
+        external fun pluginCallbackLooper(): Int
+
+        /**
+         * Reported from the native text-probe path whenever the top of the current Unity screen
+         * hierarchy changes; drives the "Switch server" overlay visibility.
+         */
+        @JvmStatic
+        fun onScreenRootChanged(root: String) {
+            ServerSwitchOverlay.onScreenRootChanged(root)
+        }
+
+        /** Result of [requestClearUserData], delivered from the native callback loop. */
+        @JvmStatic
+        fun onClearUserDataDone(success: Boolean) {
+            ServerProfileStore.onClearUserDataDone(success)
+        }
+
+        /** Reported from the native `TitlePresenter` hooks; drives the switch-button visibility. */
+        @JvmStatic
+        fun onTitleScreenChanged(visible: Boolean) {
+            ServerSwitchOverlay.onTitleScreenChanged(visible)
+        }
+    }
+
+    init {
+        ShadowHook.init(
+            ConfigBuilder()
+                .setMode(ShadowHook.Mode.UNIQUE)
+                .build()
+        )
+
+        nativeLibLoadSuccess = try {
+            System.loadLibrary(nativeLibName)
+            true
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        }
+    }
+}

@@ -9,12 +9,12 @@ plugins {
 def liteBuild = providers.gradleProperty("lite").getOrElse("false").toBoolean()
 
 android {
-    namespace 'io.github.cylear.hoshimi.localify'
+    namespace 'io.github.tokanada.hoshimi.localify'
     compileSdk 34
     ndkVersion "26.3.11579264"
 
     defaultConfig {
-        applicationId "io.github.cylear.hoshimi.localify"
+        applicationId "io.github.tokanada.hoshimi.localify"
         minSdk 29
         targetSdk 34
         versionCode 13
