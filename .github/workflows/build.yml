@@ -152,8 +152,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | contains("-data."))] | sort_by(.createdAt) | reverse | .[7:] | .[].tagName' \
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | contains("-data."))] | sort_by(.publishedAt) | reverse | .[7:] | .[].tagName' \
           | while read -r old; do
               case "$old" in
                 *-data.*) echo "Deleting old release $old"; gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes ;;

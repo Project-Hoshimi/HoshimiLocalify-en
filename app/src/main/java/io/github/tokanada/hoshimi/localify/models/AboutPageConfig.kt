@@ -4,10 +4,10 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class AboutPageConfig(
-    val plugin_repo: String = "https://github.com/tokanada/HoshimiLocalify-sr",
+    val plugin_repo: String = "https://github.com/Project-Hoshimi/HoshimiLocalify-en",
     val main_contributors: List<MainContributors> = listOf(),
     val contrib_img: ContribImg = ContribImg(
-        "https://contrib.rocks/image?repo=cylear/idolypride-addon",
+        "https://contrib.rocks/image?repo=Project-Hoshimi/HoshimiLocalify-en",
     )
 )
 

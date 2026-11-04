@@ -8,6 +8,9 @@ releases the module app; users patch their own game — no patched game is distr
 
 This is a **modified derivative** of Hoshimi Localify (GPL-3.0) — see *Upstream & credits*.
 
+The module also includes optional in-game server switching (the **Switch server** button on the
+title screen); it stays on the official servers unless you pick another server.
+
 ## Requirements
 
 - **Idol Pride, the Japanese client**, installed from Google Play
@@ -24,7 +27,8 @@ This is a **modified derivative** of Hoshimi Localify (GPL-3.0) — see *Upstrea
 - **Shizuku** — from [RikkaApps/Shizuku](https://github.com/RikkaApps/Shizuku). The manager
   needs Shizuku to patch without root (start it over ADB, over root, or — on Android 11+ —
   over wireless debugging).
-- **The module APK** from this repo's [releases](../../releases):
+- **The module APK** from this repo's
+  [releases](https://github.com/Project-Hoshimi/HoshimiLocalify-en/releases):
   `HoshimiLocalify-en-lite-<ver>.apk` (recommended) or
   `HoshimiLocalify-en-full-<ver>.apk` (adds the breast-physics parameters). Each data release produces its own GitHub release tagged `<versionName>-data.<data tag>` (newest 7 kept).
 - ~40 MB of free storage for the translation data, plus room for the patched game.
@@ -62,6 +66,13 @@ This is a **modified derivative** of Hoshimi Localify (GPL-3.0) — see *Upstrea
 8. **Play.** The game's menus, story, and master-data text now render in English.
 9. **Updating later** — from the same **Home** tab. Data updates need **no re-patch**.
 
+## Upgrading from the old module (io.github.cylear.hoshimi.localify)
+
+v1.5.0 uses a new package id, so it installs alongside the old app. Uninstall the old module, or
+disable it in LSPosed, so the game is not hooked twice. LSPosed users should enable the new module
+and set its scope to IDOLY PRIDE. Settings from the module app must be re-entered; patched game
+APKs with the embedded module need no action.
+
 ## Warnings
 
 - **Uninstall the store game first.** LSPatch re-signs the APK, so the patched build cannot
@@ -71,8 +82,9 @@ This is a **modified derivative** of Hoshimi Localify (GPL-3.0) — see *Upstrea
   server-side and unaffected.
 - **Keep the LSPatch manager (and Shizuku) installed.** Local mode is bound to the manager;
   removing either breaks module loading.
-- **Never install the KR module** (`io.github.cylear.hoshimi.localify`) alongside this one —
-  identical package id, only one can be active.
+- **Uninstall the old module.** v1.5.0 uses a new package id, so it installs alongside
+  `io.github.cylear.hoshimi.localify`; uninstall that old module, or disable it in LSPosed, so
+  the game is not hooked twice.
 - Each live-client version bump needs a re-verify pass.
 
 ## Upstream & credits
@@ -91,7 +103,3 @@ or Bandai Namco.
 
 GPL-3.0. As a modified derivative of a GPL-3.0 work, this repository is distributed under the
 same license. See `LICENSE`.
-
-## Source / sync
-
-This repo is a snapshot of a private source-of-truth fork. See `SYNC.md`.

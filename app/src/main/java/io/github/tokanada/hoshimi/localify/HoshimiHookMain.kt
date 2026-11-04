@@ -576,7 +576,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         builder.setNegativeButton(dlButton) { dialog, _ ->
             dialog.dismiss()
-            val webpage = Uri.parse("https://github.com/CyleAR/idolypride-addon")
+            val webpage = Uri.parse("https://github.com/Project-Hoshimi/HoshimiLocalify-en")
             val intent = Intent(Intent.ACTION_VIEW, webpage)
             activity.startActivity(intent)
         }
