@@ -17,8 +17,8 @@ android {
         applicationId "io.github.tokanada.hoshimi.localify"
         minSdk 29
         targetSdk 34
-        versionCode 14
-        versionName "v1.5.0"
+        versionCode 15
+        versionName "v1.5.1"
         buildConfigField "String", "VERSION_NAME", "\"${versionName}\""
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
