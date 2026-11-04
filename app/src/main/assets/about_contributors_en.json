@@ -1,5 +1,5 @@
 {
-    "plugin_repo": "https://github.com/cylear/idolypride-addon",
+    "plugin_repo": "https://github.com/tokanada/HoshimiLocalify-sr",
     "main_contributors": [
         {
             "name": "Cyle (Import to Idolypride)",
@@ -11,6 +11,12 @@
             "name": "chinosk (Plugin code)",
             "links": [
                 {"name": "Github", "link": "https://github.com/chinosk6"}
+            ]
+        },
+        {
+            "name": "tokanada (English patch)",
+            "links": [
+                {"name": "Github", "link": "https://github.com/tokanada"}
             ]
         }
     ],
