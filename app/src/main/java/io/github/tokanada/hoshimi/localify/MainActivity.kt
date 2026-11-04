@@ -48,10 +48,15 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
     override lateinit var programConfigFactory: ProgramConfigViewModelFactory
     override lateinit var programConfigViewModel: ProgramConfigViewModel
 
+    private var oldModuleInstalled by mutableStateOf(false)
+    private var oldModulePromptPostponed by mutableStateOf(false)
+    private var oldModulePromptHidden by mutableStateOf(false)
+
     companion object {
         // Set by NarrativeNotifier: open this activity and start the game right away.
         const val EXTRA_AUTO_START_GAME = "hoshimiAutoStartGame"
         const val EXTRA_GAME_PACKAGE = "hoshimiGamePackage"
+        private const val STATE_OLD_MODULE_PROMPT_POSTPONED = "hoshimiOldModulePromptPostponed"
     }
 
     private fun showToast(message: String) {
@@ -138,6 +143,29 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
         startActivity(intent)
     }
 
+    fun isOldModulePromptVisible(): Boolean {
+        return oldModuleInstalled &&
+                !oldModulePromptPostponed &&
+                !oldModulePromptHidden
+    }
+
+    fun uninstallOldModule() {
+        // Close the dialog now; onResume re-checks and only shows it again if the old module is
+        // still installed (for example, the user cancelled the uninstall).
+        oldModuleInstalled = false
+        startActivity(OldModuleCheck.uninstallIntent())
+    }
+
+    fun postponeOldModulePrompt() {
+        oldModulePromptPostponed = true
+    }
+
+    fun hideOldModulePrompt() {
+        OldModuleCheck.setPromptHidden(this, true)
+        oldModulePromptHidden = true
+        oldModulePromptPostponed = true
+    }
+
     override fun pushKeyEvent(event: KeyEvent): Boolean {
         return dispatchKeyEvent(event)
     }
@@ -157,6 +185,9 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
 
     override fun onResume() {
         super.onResume()
+        // Re-checked on every resume so the prompt disappears once the old module is gone.
+        oldModuleInstalled = OldModuleCheck.isInstalled(this)
+        oldModulePromptHidden = OldModuleCheck.isPromptHidden(this)
         lifecycleScope.launch {
             displayedBuiltInVersion = withContext(Dispatchers.IO) {
                 try {
@@ -171,6 +202,9 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        oldModulePromptPostponed =
+            savedInstanceState?.getBoolean(STATE_OLD_MODULE_PROMPT_POSTPONED) ?: false
 
         loadConfig()
 
@@ -194,6 +228,11 @@ class MainActivity : ComponentActivity(), ConfigUpdateListener, IConfigurableAct
             onClickStartGame(intent.getStringExtra(EXTRA_GAME_PACKAGE))
             finish()
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_OLD_MODULE_PROMPT_POSTPONED, oldModulePromptPostponed)
     }
 
     override fun onNewIntent(intent: Intent) {

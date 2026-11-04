@@ -1,5 +1,5 @@
 {
-    "plugin_repo": "https://github.com/tokanada/HoshimiLocalify-sr",
+    "plugin_repo": "https://github.com/Project-Hoshimi/HoshimiLocalify-en",
     "main_contributors": [
         {
             "name": "Cyle (Import to Idolypride)",
@@ -21,7 +21,6 @@
         }
     ],
     "contrib_img": {
-        "plugin": "https://contrib.rocks/image?repo=cylear/idolypride-addon",
-        "extra_avatars": ["https://github.com/tokanada.png?size=128"]
+        "plugin": "https://contrib.rocks/image?repo=Project-Hoshimi/HoshimiLocalify-en"
     }
 }

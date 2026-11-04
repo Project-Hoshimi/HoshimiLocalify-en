@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.tokanada.hoshimi.localify.MainActivity
+import io.github.tokanada.hoshimi.localify.OldModulePromptDialog
 import io.github.tokanada.hoshimi.localify.R
 import io.github.tokanada.hoshimi.localify.TAG
 import io.github.tokanada.hoshimi.localify.getMainUIConfirmState
@@ -114,6 +115,14 @@ fun MainUI(modifier: Modifier = Modifier, context: MainActivity? = null,
                     }
                 }
             }
+        }
+
+        if (context != null && context.isOldModulePromptVisible()) {
+            OldModulePromptDialog(
+                onUninstall = { context.uninstallOldModule() },
+                onLater = { context.postponeOldModulePrompt() },
+                onDontShowAgain = { context.hideOldModulePrompt() }
+            )
         }
     }
 }
