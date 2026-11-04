@@ -149,6 +149,15 @@ object ServerPromptDialog {
         }
         group.addView(addRadio, matchWidth())
 
+        if (profiles.any { it.kind != ServerProfile.KIND_OFFICIAL && it.id != activeId }) {
+            container.addView(TextView(activity).apply {
+                text = "Long-press a saved server to remove it."
+                textSize = 13f
+                alpha = 0.7f
+                setPadding(0, dp(activity, 8), 0, 0)
+            }, matchWidth())
+        }
+
         group.setOnCheckedChangeListener { _, checkedId ->
             try {
                 if (checkedId == addRadio.id) {
