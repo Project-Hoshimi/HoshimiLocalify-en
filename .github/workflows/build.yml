@@ -67,7 +67,7 @@ jobs:
           ver="${PAYLOAD_TAG:-}"
           if [ -z "$ver" ]; then
             for i in 1 2 3 4 5; do
-              if ver="$(gh api repos/tokanada/ipr-translation-data-en/releases/latest --jq .tag_name 2>/tmp/latest.err)" \
+              if ver="$(gh api repos/Project-Hoshimi/ipr-translation-data-en/releases/latest --jq .tag_name 2>/tmp/latest.err)" \
                  && [ -n "$ver" ] && [ "$ver" != "null" ]; then
                 break
               fi
@@ -78,7 +78,7 @@ jobs:
           fi
           if [ -z "$ver" ] || [ "$ver" = "null" ]; then echo "Could not read latest data release tag" >&2; exit 1; fi
           echo "Using data release $ver"
-          curl -fL --retry 3 --retry-delay 5 -o /tmp/en.zip "https://github.com/tokanada/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/en.zip "https://github.com/Project-Hoshimi/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
           mkdir -p app/src/main/assets/hoshimi-local
           unzip -qo /tmp/en.zip -d app/src/main/assets/hoshimi-local
           echo "data_tag=$ver" >> "$GITHUB_OUTPUT"

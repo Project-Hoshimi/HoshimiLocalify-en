@@ -138,7 +138,7 @@
     <string name="translation_resource_update">Translation Resource Update</string>
 
     <string name="about_contributors_asset_file">about_contributors_en.json</string>
-    <string name="default_assets_check_api">https://api.github.com/repos/tokanada/ipr-translation-data-en/releases/latest</string>
+    <string name="default_assets_check_api">https://api.github.com/repos/Project-Hoshimi/ipr-translation-data-en/releases/latest</string>
 
     <string name="old_module_prompt_title">Old HoshimiLocalify module found</string>
     <string name="old_module_prompt_message">The previous version (io.github.cylear.hoshimi.localify) is still installed. Uninstall it, or disable it in LSPosed, so the game isn\'t hooked twice.\n\nSettings from the old app don\'t carry over. If you use LSPosed, enable this module and set its scope to IDOLY PRIDE.</string>

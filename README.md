@@ -61,7 +61,7 @@ title screen); it stays on the official servers unless you pick another server.
    Relaunch the game if it was already open.
 7. **Fetch the translations.** Open **Hoshimi Localify EN → Home**; it downloads the data
    (~35–40 MB, roughly 4350 files) from
-   [`tokanada/ipr-translation-data-en`](https://github.com/tokanada/ipr-translation-data-en)'s
+   [`Project-Hoshimi/ipr-translation-data-en`](https://github.com/Project-Hoshimi/ipr-translation-data-en)'s
    latest release and reports the current resource version.
 8. **Play.** The game's menus, story, and master-data text now render in English.
 9. **Updating later** — from the same **Home** tab. Data updates need **no re-patch**.
