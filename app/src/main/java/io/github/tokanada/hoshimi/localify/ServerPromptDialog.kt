@@ -250,7 +250,9 @@ object ServerPromptDialog {
                 "deleted from the server.\n\n" +
                 "To log in to an account again after switching, whether your current account or " +
                 "an existing account on $displayName, it must be linked (data link / account " +
-                "transfer). If your current account is not linked yet, cancel and link it first."
+                "transfer). If your current account is not linked yet, cancel and link it first.\n\n" +
+                "The game will close after the data is cleared. Reopen it manually to connect " +
+                "to $displayName."
         try {
             AlertDialog.Builder(activity)
                 .setTitle("Switch server?")

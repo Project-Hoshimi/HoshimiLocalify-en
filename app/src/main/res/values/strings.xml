@@ -31,7 +31,7 @@
     <string name="private_server_step_open_game">1. Open the game and wait for the title screen.</string>
     <string name="private_server_step_switch_server">2. Tap Switch server (above TAP TO START).</string>
     <string name="private_server_step_pick_or_add">3. Pick Official or a saved server, or tap Add server to enter a new URL. Long-press a saved server (not the current one) to remove it.</string>
-    <string name="private_server_switch_warning">Switching servers clears the game\'s local account data. Note your account ID / transfer code first.</string>
+    <string name="private_server_switch_warning">Switching servers clears the game\'s local account data. Note your account ID / transfer code first. The game then closes; reopen it manually to connect to the new server.</string>
     <string name="max_high">Ultra</string>
     <string name="very_high">Very High</string>
     <string name="hign">High</string>
