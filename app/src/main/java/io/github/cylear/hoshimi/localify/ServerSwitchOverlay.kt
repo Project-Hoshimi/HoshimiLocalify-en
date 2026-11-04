@@ -34,7 +34,7 @@ object ServerSwitchOverlay {
     private val GAME_SCREEN_ROOT_SUFFIXES = listOf("Window(Clone)", "Screen(Clone)")
 
     /** Raise the button off the bottom edge by this fraction of the screen height. */
-    private const val BOTTOM_OFFSET_FRACTION = 0.22f
+    private const val BOTTOM_OFFSET_FRACTION = 0.15f
 
     private const val BUTTON_TEXT = "Switch server"
     private const val MANAGED_MESSAGE = "Server is managed by the HoshimiLocalify app"
@@ -97,7 +97,7 @@ object ServerSwitchOverlay {
             val params = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.START
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             ).apply {
                 val margin = dp(activity, MARGIN_DP)
                 val bottom = margin +
