@@ -9,7 +9,6 @@ import android.util.Log
 import io.github.tokanada.hoshimi.localify.models.IdolyprideConfig
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
@@ -80,7 +79,9 @@ object ServerProfileStore {
     private const val FILE_PROFILES = "profiles.json"
     private const val FILE_ACTIVE = "active.json"
     private const val FILE_PENDING = "pending.json"
-    private const val FILE_SUGGESTED = "suggested.json"
+
+    /** Removed companion-app suggestion list; only read to clean it up from older installs. */
+    private const val FILE_LEGACY_SUGGESTED = "suggested.json"
 
     /**
      * Marker written right before a switch relaunch. Native runs the game's own Delete Data
@@ -122,7 +123,6 @@ object ServerProfileStore {
         prettyPrint = true
     }
     private val profileListSerializer = ListSerializer(ServerProfile.serializer())
-    private val suggestedServerListSerializer = ListSerializer(String.serializer())
 
     /** Synchronises this object's file access; every entry point may run on any thread. */
     private val lock = Any()
@@ -190,31 +190,31 @@ object ServerProfileStore {
 
     fun profilesDirForDataDir(dataDir: File): File = profilesDir(File(dataDir, "files"))
 
-    // ---- suggested servers (companion app) ----------------------------------------------
+    // ---- removal -------------------------------------------------------------------------
 
-    /** Replaces `suggested.json` with [urls] as received. */
-    fun updateSuggestedServers(filesDir: File, urls: List<String>) {
+    /**
+     * Deletes the saved private profile [profileId] together with its per-profile certificate and
+     * account data.
+     *
+     * Refuses the official profile and the profile that is currently active: the game must never
+     * delete the server it is running on (or the account files that belong to it). Returns true
+     * only when an entry was actually removed.
+     */
+    fun removeProfile(context: Context, profileId: String): Boolean =
+        removeProfile(context.filesDir, profileId)
+
+    fun removeProfile(filesDir: File, profileId: String): Boolean {
+        if (profileId == ServerProfile.OFFICIAL_ID) return false
         synchronized(lock) {
-            try {
-                writeAtomically(
-                    File(profilesDir(filesDir), FILE_SUGGESTED),
-                    json.encodeToString(suggestedServerListSerializer, urls)
-                )
-            } catch (t: Throwable) {
-                Log.e(TAG, "ServerProfileStore: cannot update suggested servers", t)
-            }
-        }
-    }
-
-    /** Reads `suggested.json`; a missing or malformed file yields an empty list. */
-    fun readSuggestedServers(filesDir: File): List<String> = synchronized(lock) {
-        val file = File(profilesDir(filesDir), FILE_SUGGESTED)
-        try {
-            if (!file.isFile) emptyList()
-            else json.decodeFromString(suggestedServerListSerializer, file.readText())
-        } catch (t: Throwable) {
-            Log.w(TAG, "ServerProfileStore: cannot read ${file.absolutePath}", t)
-            emptyList()
+            val profiles = ArrayList(loadProfilesLocked(filesDir))
+            val index = profiles.indexOfFirst { it.id == profileId }
+            if (index < 0) return false
+            if (readActiveIdLocked(filesDir) == profileId) return false
+            profiles.removeAt(index)
+            saveProfilesLocked(filesDir, profiles)
+            deleteRecursively(File(profilesDir(filesDir), profileId))
+            Log.i(TAG, "ServerProfileStore: removed profile $profileId")
+            return true
         }
     }
 
@@ -242,6 +242,12 @@ object ServerProfileStore {
     private fun loadProfilesLocked(filesDir: File): List<ServerProfile> {
         val dir = profilesDir(filesDir)
         val file = File(dir, FILE_PROFILES)
+        // The companion app used to publish a list of suggested URLs here; the list is gone, so
+        // drop the stale file instead of leaving dead state behind.
+        val staleSuggestions = File(dir, FILE_LEGACY_SUGGESTED)
+        if (staleSuggestions.exists()) {
+            deleteRecursively(staleSuggestions)
+        }
         var corrupt = false
         val parsed = try {
             if (file.isFile) {

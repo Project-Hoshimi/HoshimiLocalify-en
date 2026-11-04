@@ -128,24 +128,16 @@ object ServerPromptDialog {
                 setPadding(0, dp(activity, 6), 0, dp(activity, 6))
                 if (profile.id == activeId) isChecked = true
             }
-            profileIds[radio.id] = profile.id
-            group.addView(radio, matchWidth())
-        }
-
-        val suggestionUrls = HashMap<Int, String>()
-        val knownIds = profiles.map { it.id }.toMutableSet()
-        for (suggestion in ServerProfileStore.readSuggestedServers(filesDir)) {
-            val address = ServerProfileStore.parseServerAddress(suggestion) ?: continue
-            val profileId = ServerProfileStore.profileIdFor(address.url)
-            if (profileId in knownIds) continue
-            knownIds += profileId
-            val radio = RadioButton(activity).apply {
-                id = View.generateViewId()
-                text = "$suggestion (from app)"
-                textSize = 16f
-                setPadding(0, dp(activity, 6), 0, dp(activity, 6))
+            if (profile.kind != ServerProfile.KIND_OFFICIAL && profile.id != activeId) {
+                // RadioButton rows must stay direct children of the RadioGroup, so the least
+                // invasive place for the extra action is a long-press on the row.
+                radio.isLongClickable = true
+                radio.setOnLongClickListener {
+                    confirmRemove(activity, dialog, profile)
+                    true
+                }
             }
-            suggestionUrls[radio.id] = suggestion
+            profileIds[radio.id] = profile.id
             group.addView(radio, matchWidth())
         }
 
@@ -163,17 +155,6 @@ object ServerPromptDialog {
                     promptForUrl(activity, dialog, initial = "")
                     return@setOnCheckedChangeListener
                 }
-                val suggestionUrl = suggestionUrls[checkedId]
-                if (suggestionUrl != null) {
-                    val parsed = ServerProfileStore.parseServerInput(suggestionUrl)
-                    if (parsed == null) {
-                        promptForUrl(activity, dialog, initial = suggestionUrl)
-                    }
-                    else {
-                        startBootstrap(activity, parsed, suggestionUrl, dialog)
-                    }
-                    return@setOnCheckedChangeListener
-                }
                 val profileId = profileIds[checkedId] ?: return@setOnCheckedChangeListener
                 handleSelection(activity, dialog, profileId)
             }
@@ -182,6 +163,36 @@ object ServerPromptDialog {
             }
         }
         dialog.show()
+    }
+
+    /** Removes a saved but inactive private profile after an explicit confirmation. */
+    private fun confirmRemove(activity: Activity, listDialog: AlertDialog, profile: ServerProfile) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: the activity is gone; skipping the remove confirmation")
+            return
+        }
+        try {
+            AlertDialog.Builder(activity)
+                .setTitle("Remove server?")
+                .setMessage(profile.url)
+                .setPositiveButton("Remove") { d, _ ->
+                    d.dismiss()
+                    val removed = ServerProfileStore.removeProfile(activity.filesDir, profile.id)
+                    if (removed) {
+                        Toast.makeText(
+                            activity,
+                            "Removed ${profile.label.ifBlank { profile.url }}",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                    restartList(activity, listDialog)
+                }
+                .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+                .show()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerSwitch: cannot show the remove confirmation", t)
+        }
     }
 
     private fun handleSelection(activity: Activity, dialog: AlertDialog, profileId: String) {

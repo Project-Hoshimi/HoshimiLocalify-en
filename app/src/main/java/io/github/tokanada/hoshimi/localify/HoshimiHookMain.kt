@@ -302,11 +302,6 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             catch (e: Exception) {
                 null
             }
-            // The module app only suggests servers; the in-game picker owns the active one.
-            // Only the game's main process maintains the shared suggestion file.
-            if (initConfig != null && mainProcess) {
-                ServerProfileStore.updateSuggestedServers(activity.filesDir, initConfig.suggestedServerUrls)
-            }
             // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
             // configuration is seen (usually a no-op, the launch intent already delivered it).
             // A malformed payload decodes to null and is ignored by the trust layer.

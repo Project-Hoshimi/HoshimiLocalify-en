@@ -35,7 +35,6 @@ data class IdolyprideConfig (
     var privateServerEnabled: Boolean = false,
     var privateServerUrl: String = "",
     var privateServerCaPem: String = "",
-    var suggestedServerUrls: List<String> = emptyList(),
 
     var useCustomeGraphicSettings: Boolean = false,
     var graphicQuality: Int = 0,

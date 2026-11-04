@@ -27,11 +27,6 @@
     <string name="export_text">텍스트 내보내기</string>
     <string name="force_export_resource">리소스 강제 내보내기</string>
     <string name="private_server">프라이빗 서버</string>
-    <string name="private_server_enabled">프라이빗 서버 사용</string>
-    <string name="private_server_url">서버 주소</string>
-    <string name="private_server_url_hint">https://sumire.lan:8443</string>
-    <string name="private_server_ca_pem">서버 CA (PEM)</string>
-    <string name="private_server_note">게임을 프라이빗 서버로 연결합니다. 공식 서버를 사용하려면 끄십시오. 주소는 스킴, 호스트, 포트 순이며 끝에 슬래시를 붙이지 않습니다. CA에는 프라이빗 서버의 인증 기관 인증서를 PEM 형식으로 붙여넣으십시오.</string>
     <string name="max_high">울트라</string>
     <string name="very_high">매우 높음</string>
     <string name="hign">높음</string>

@@ -21,7 +21,6 @@ interface ConfigListener {
     fun onPrivateServerEnabledChanged(value: Boolean)
     fun onPrivateServerUrlChanged(value: String)
     fun onPrivateServerCaPemChanged(value: String)
-    fun onSuggestedServerUrlsChanged(value: List<String>)
     fun onTextTestChanged(value: Boolean)
     fun onUseMasterTransChanged(value: Boolean)
     fun onReplaceFontChanged(value: Boolean)
@@ -144,11 +143,6 @@ interface ConfigUpdateListener: ConfigListener, IHasConfigItems {
 
     override fun onPrivateServerCaPemChanged(value: String) {
         config.privateServerCaPem = value
-        saveConfig()
-    }
-
-    override fun onSuggestedServerUrlsChanged(value: List<String>) {
-        config.suggestedServerUrls = value
         saveConfig()
     }
 
