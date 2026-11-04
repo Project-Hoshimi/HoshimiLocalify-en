@@ -250,14 +250,38 @@ object ServerPromptDialog {
                 "deleted from the server.\n\n" +
                 "To log in to an account again after switching, whether your current account or " +
                 "an existing account on $displayName, it must be linked (data link / account " +
-                "transfer). If your current account is not linked yet, cancel and link it first.\n\n" +
-                "The game will close after the data is cleared. Reopen it manually to connect " +
-                "to $displayName."
+                "transfer). If your current account is not linked yet, cancel and link it first."
         try {
             AlertDialog.Builder(activity)
                 .setTitle("Switch server?")
                 .setMessage(message)
                 .setPositiveButton("Clear data and switch") { d, _ ->
+                    d.dismiss()
+                    confirmGameWillClose(activity, listDialog, profileId)
+                }
+                .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+                .show()
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerSwitch: cannot show the switch confirmation", t)
+        }
+    }
+
+    /** Second step: tells the user the game closes to finish the switch and must be reopened. */
+    private fun confirmGameWillClose(activity: Activity, listDialog: AlertDialog, profileId: String) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.i(TAG, "ServerSwitch: the activity is gone; skipping the close notice")
+            return
+        }
+        try {
+            AlertDialog.Builder(activity)
+                .setTitle("The game will close")
+                .setMessage(
+                    "The game will close to finish the server change.\n\n" +
+                            "Please reopen the game afterwards."
+                )
+                .setCancelable(false)
+                .setPositiveButton("OK") { d, _ ->
                     d.dismiss()
                     listDialog.dismiss()
                     ServerProfileStore.requestSwitch(activity, profileId)
@@ -266,7 +290,7 @@ object ServerPromptDialog {
                 .show()
         }
         catch (t: Throwable) {
-            Log.e(TAG, "ServerSwitch: cannot show the switch confirmation", t)
+            Log.e(TAG, "ServerSwitch: cannot show the close notice", t)
         }
     }
 
