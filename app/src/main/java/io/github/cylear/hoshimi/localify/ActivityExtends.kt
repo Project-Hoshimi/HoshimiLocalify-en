@@ -86,8 +86,16 @@ fun <T> T.loadConfig() where T : Activity, T : IHasConfigItems {
         config.privateServerUrl = ""
         config.privateServerCaPem = ""
         Log.i(TAG, "PrivateServerPage: migrated $migratedUrl into suggested servers")
+        // Persist here: the activity that answers the game's config request has a no-op
+        // saveConfig() and forwards the file verbatim, so the migration must reach disk.
+        try {
+            File(filesDir, "ipr-config.json").writeText(json.encodeToString(IdolyprideConfig.serializer(), config))
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "PrivateServerPage: cannot persist the migrated config", t)
+        }
+        saveConfig()
     }
-    saveConfig()
 
     val programConfigStr = getProgramConfigContent()
     programConfig = try {
