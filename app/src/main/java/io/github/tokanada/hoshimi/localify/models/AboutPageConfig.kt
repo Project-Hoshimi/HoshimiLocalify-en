@@ -19,7 +19,9 @@ data class MainContributors(
 
 @Serializable
 data class ContribImg(
-    val plugin: String
+    val plugin: String,
+    /** Extra avatar image URLs drawn after the contrib.rocks graph (fork contributors). */
+    val extra_avatars: List<String> = listOf()
 )
 
 @Serializable

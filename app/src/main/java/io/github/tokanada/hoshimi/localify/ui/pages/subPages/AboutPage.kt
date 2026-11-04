@@ -9,6 +9,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.sizeIn
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -134,7 +142,7 @@ fun AboutPage(modifier: Modifier = Modifier,
                         Text(stringResource(R.string.all_translators), fontSize = 16.sp)
                         IPButton(text = stringResource(R.string.translation_sheet), modifier = modifier.height(40.dp),
                             onClick = {
-                                context?.openUrl("https://hoshimistation.cyle.me")
+                                context?.openUrl("https://hoshimistation.tokanada.com")
                             })
                     }
                 }
@@ -145,10 +153,30 @@ fun AboutPage(modifier: Modifier = Modifier,
             Text(stringResource(R.string.contributors), fontSize = 24.sp, color = MaterialTheme.colorScheme.onPrimaryContainer)
 
             Text(stringResource(R.string.plugin_code), fontSize = 16.sp)
-            NetworkSvgImage(
-                url = contributorInfo.contrib_img.plugin,
-                contentDescription = "plugin-contrib"
-            )
+            val density = LocalDensity.current
+            var graphHeight by remember { mutableStateOf(0.dp) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                NetworkSvgImage(
+                    url = contributorInfo.contrib_img.plugin,
+                    contentDescription = "plugin-contrib",
+                    modifier = Modifier.onSizeChanged {
+                        graphHeight = with(density) { it.height.toDp() }
+                    }
+                )
+                // Match the graph's avatar size once it has loaded; contrib.rocks pads each
+                // avatar slightly, so shrink a little and keep the same gap.
+                val avatarSize = if (graphHeight > 0.dp) graphHeight * 0.94f else 40.dp
+                for (url in contributorInfo.contrib_img.extra_avatars) {
+                    NetworkImage(
+                        url = url,
+                        contentDescription = "contributor-avatar",
+                        modifier = Modifier
+                            .padding(start = avatarSize * 0.06f)
+                            .size(avatarSize)
+                            .clip(CircleShape)
+                    )
+                }
+            }
         }
 
         item {

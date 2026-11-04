@@ -21,6 +21,7 @@
         }
     ],
     "contrib_img": {
-        "plugin": "https://contrib.rocks/image?repo=cylear/idolypride-addon"
+        "plugin": "https://contrib.rocks/image?repo=cylear/idolypride-addon",
+        "extra_avatars": ["https://github.com/tokanada.png?size=128"]
     }
 }
