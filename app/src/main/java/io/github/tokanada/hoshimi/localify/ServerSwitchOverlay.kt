@@ -1,6 +1,7 @@
 package io.github.tokanada.hoshimi.localify
 
 import android.app.Activity
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -8,6 +9,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -33,8 +35,8 @@ object ServerSwitchOverlay {
      */
     private val GAME_SCREEN_ROOT_SUFFIXES = listOf("Window(Clone)", "Screen(Clone)")
 
-    /** Raise the button off the bottom edge by this fraction of the screen height. */
-    private const val BOTTOM_OFFSET_FRACTION = 0.15f
+    /** Top margin used when the window insets are not available yet. */
+    private const val FALLBACK_TOP_MARGIN_DP = 32
 
     private const val BUTTON_TEXT = "Switch server"
     private const val MANAGED_MESSAGE = "Server is managed by the HoshimiLocalify app"
@@ -97,12 +99,13 @@ object ServerSwitchOverlay {
             val params = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                Gravity.TOP or Gravity.END
             ).apply {
+                // Top-right: the title screen's version label is top-left, the cutout and logo
+                // top-center, and the Account sheet opens over the bottom half.
                 val margin = dp(activity, MARGIN_DP)
-                val bottom = margin +
-                        (activity.resources.displayMetrics.heightPixels * BOTTOM_OFFSET_FRACTION).toInt()
-                setMargins(margin, margin, margin, bottom)
+                val top = topInset(root)?.let { it + margin } ?: dp(activity, FALLBACK_TOP_MARGIN_DP)
+                setMargins(margin, top, margin, margin)
             }
             root.addView(button, params)
             activityRef = WeakReference(activity)
@@ -171,6 +174,18 @@ object ServerSwitchOverlay {
             catch (t: Throwable) {
                 Log.w(TAG, "ServerSwitch: cannot update the overlay from the title presenter", t)
             }
+        }
+    }
+
+    /** Top inset of the status bar and display cutout, or null if the insets are not known yet. */
+    private fun topInset(view: View): Int? {
+        val insets = view.rootWindowInsets ?: return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()).top
+        }
+        else {
+            @Suppress("DEPRECATION")
+            maxOf(insets.systemWindowInsetTop, insets.displayCutout?.safeInsetTop ?: 0)
         }
     }
 
