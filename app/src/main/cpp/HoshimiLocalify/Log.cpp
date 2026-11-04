@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <queue>
+#include <mutex>
 #include <cstdarg>
 
 #include <android/log.h>
@@ -28,6 +29,19 @@ extern jmethodID showToastMethodId;
 namespace HoshimiLocal::Log {
     namespace {
         std::queue<std::string> showingToasts{};
+        // Only the newest screen root matters: the Kotlin overlay just shows/hides a button.
+        std::string pendingScreenRoot{};
+        bool hasPendingScreenRoot = false;
+        std::mutex screenRootMutex{};
+
+        // Newest title-presenter visibility, and the result of a requested account wipe.
+        bool pendingTitleVisible = false;
+        bool hasPendingTitleVisible = false;
+        std::mutex titleMutex{};
+
+        bool pendingClearResult = false;
+        bool hasPendingClearResult = false;
+        std::mutex clearMutex{};
     }
 
     std::string StringFormat(const char* fmt, ...) {
@@ -138,6 +152,114 @@ namespace HoshimiLocal::Log {
         }
         else {
             _showToastMethodId = env->GetStaticMethodID(clazz, "showToast", "(Ljava/lang/String;)V");
+        }
+    }
+
+    void SetScreenRoot(const std::string& root) {
+        if (root.empty()) return;
+        std::lock_guard<std::mutex> guard(screenRootMutex);
+        pendingScreenRoot = root;
+        hasPendingScreenRoot = true;
+    }
+
+    // Mirrors ToastLoop: drains the newest detected screen root to the Kotlin overlay.
+    void ScreenRootLoop(JNIEnv *env, jclass clazz) {
+        if (!env || !clazz) return;
+
+        std::string root;
+        {
+            std::lock_guard<std::mutex> guard(screenRootMutex);
+            if (!hasPendingScreenRoot) return;
+            root = pendingScreenRoot;
+            hasPendingScreenRoot = false;
+            pendingScreenRoot.clear();
+        }
+
+        static auto onScreenRootChangedMethodId =
+            env->GetStaticMethodID(clazz, "onScreenRootChanged", "(Ljava/lang/String;)V");
+        if (!onScreenRootChangedMethodId) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            Debug("ScreenRootLoop: onScreenRootChanged is missing");
+            return;
+        }
+
+        jstring param = env->NewStringUTF(root.c_str());
+        if (!param) return;
+        env->CallStaticVoidMethod(clazz, onScreenRootChangedMethodId, param);
+        env->DeleteLocalRef(param);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            DebugFmt("ScreenRootLoop: onScreenRootChanged threw for %s", root.c_str());
+        }
+    }
+
+    void SetTitleScreenVisible(bool visible) {
+        std::lock_guard<std::mutex> guard(titleMutex);
+        pendingTitleVisible = visible;
+        hasPendingTitleVisible = true;
+    }
+
+    // Drains the newest title-presenter visibility to ServerSwitchOverlay.
+    void TitleScreenLoop(JNIEnv *env, jclass clazz) {
+        if (!env || !clazz) return;
+
+        bool visible;
+        {
+            std::lock_guard<std::mutex> guard(titleMutex);
+            if (!hasPendingTitleVisible) return;
+            visible = pendingTitleVisible;
+            hasPendingTitleVisible = false;
+        }
+
+        static auto onTitleScreenChangedMethodId =
+            env->GetStaticMethodID(clazz, "onTitleScreenChanged", "(Z)V");
+        if (!onTitleScreenChangedMethodId) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            Debug("TitleScreenLoop: onTitleScreenChanged is missing");
+            return;
+        }
+
+        env->CallStaticVoidMethod(
+            clazz, onTitleScreenChangedMethodId, visible ? JNI_TRUE : JNI_FALSE
+        );
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            DebugFmt("TitleScreenLoop: onTitleScreenChanged threw for %d", visible ? 1 : 0);
+        }
+    }
+
+    void SetClearUserDataResult(bool success) {
+        std::lock_guard<std::mutex> guard(clearMutex);
+        pendingClearResult = success;
+        hasPendingClearResult = true;
+    }
+
+    // Drains the result of a requested account wipe to ServerProfileStore.
+    void ClearUserDataLoop(JNIEnv *env, jclass clazz) {
+        if (!env || !clazz) return;
+
+        bool success;
+        {
+            std::lock_guard<std::mutex> guard(clearMutex);
+            if (!hasPendingClearResult) return;
+            success = pendingClearResult;
+            hasPendingClearResult = false;
+        }
+
+        static auto onClearUserDataDoneMethodId =
+            env->GetStaticMethodID(clazz, "onClearUserDataDone", "(Z)V");
+        if (!onClearUserDataDoneMethodId) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            Debug("ClearUserDataLoop: onClearUserDataDone is missing");
+            return;
+        }
+
+        env->CallStaticVoidMethod(
+            clazz, onClearUserDataDoneMethodId, success ? JNI_TRUE : JNI_FALSE
+        );
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            DebugFmt("ClearUserDataLoop: onClearUserDataDone threw for %d", success ? 1 : 0);
         }
     }
 }

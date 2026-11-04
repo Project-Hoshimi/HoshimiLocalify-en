@@ -5,9 +5,12 @@
 #include "Log.h"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 #include "Il2cppUtils.hpp"
+#include "PrivateServer.hpp"
 #include "Local.h"
 #include "MasterLocal.h"
 #include "StoryDict.hpp"
+#include "RenderResolution.hpp"
+#include "GraphicsQuality.hpp"
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -22,9 +25,13 @@
 #include <fstream>
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <atomic>
 
 std::unordered_set<void*> hookedStubs{};
 extern std::filesystem::path hoshimiLocalPath;
+
+// Defined in libHoshimiLocalify.cpp; set by HoshimiHookMain.requestClearUserData.
+extern std::atomic<bool> g_clearUserDataRequested;
 
 
 #define DEFINE_HOOK(returnType, name, params)                                                      \
@@ -373,13 +380,74 @@ namespace HoshimiLocal::HookMain {
         return Unity_set_position_Injected_Orig(self, data);
     }
 
-    DEFINE_HOOK(void*, InternalSetOrientationAsync, (void* self, int type, void* c, void* tc, void* mtd)) {
+    struct SolisUniTask {
+        void* source;
+        int16_t token;
+        int16_t padding0;
+        int32_t padding1;
+    };
+
+    struct SolisCancellationToken {
+        void* source;
+    };
+
+    static_assert(sizeof(SolisUniTask) == 16);
+    static_assert(sizeof(SolisCancellationToken) == sizeof(void*));
+
+    DEFINE_HOOK(SolisUniTask, InternalSetOrientationAsync,
+                (void* self, int type, SolisCancellationToken cancellationToken, void* method)) {
         switch (Config::gameOrientation) {
         case 1: type = 0x2; break;  // FixedPortrait
         case 2: type = 0x3; break;  // FixedLandscape
         default: break;
         }
-        return InternalSetOrientationAsync_Orig(self, type, c, tc, mtd);
+        return InternalSetOrientationAsync_Orig(self, type, cancellationToken, method);
+    }
+
+    // Solis.Title.TitlePresenter drives the title-screen button visibility. Missing methods only
+    // log, so a game update cannot break the rest of the hooks.
+    DEFINE_HOOK(SolisUniTask, TitlePresenter_Start, (void* self, void* method)) {
+        const auto ret = TitlePresenter_Start_Orig(self, method);
+        HoshimiLocal::Log::SetTitleScreenVisible(true);
+        return ret;
+    }
+
+    DEFINE_HOOK(SolisUniTask, TitlePresenter_MoveOutGameAsync,
+                (void* self, SolisCancellationToken cancellationToken, void* method)) {
+        HoshimiLocal::Log::SetTitleScreenVisible(false);
+        return TitlePresenter_MoveOutGameAsync_Orig(self, cancellationToken, method);
+    }
+
+    DEFINE_HOOK(void, TitlePresenter_OnDestroy, (void* self, void* method)) {
+        HoshimiLocal::Log::SetTitleScreenVisible(false);
+        TitlePresenter_OnDestroy_Orig(self, method);
+    }
+
+    // Runs the game's own Delete Data routine on the Unity main thread. Returns true only when
+    // the method was resolved and the managed call returned without throwing.
+    bool ClearUserDataOnce() {
+        const auto klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.Common",
+                                                 "SolisInitializer");
+        if (!klass) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer not found");
+            return false;
+        }
+        const auto method = Il2cppUtils::il2cpp_class_get_method_from_name(
+                klass->address, "ClearUserData", 1);
+        if (!method || !method->methodPointer) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer.ClearUserData not found");
+            return false;
+        }
+
+        void* args[1] = { nullptr };  // ClearUserData(string migrationPublicUserId = null)
+        void* exception = nullptr;
+        UnityResolve::Invoke<void*>("il2cpp_runtime_invoke", method, nullptr, args, &exception);
+        if (exception) {
+            HoshimiLocal::Log::Error("ServerSwitch: SolisInitializer.ClearUserData threw");
+            return false;
+        }
+        HoshimiLocal::Log::Info("ServerSwitch: SolisInitializer.ClearUserData -> ok");
+        return true;
     }
 
     void UpdatePhoneSubtitleOverlay();
@@ -387,6 +455,10 @@ namespace HoshimiLocal::HookMain {
     DEFINE_HOOK(void, EndCameraRendering, (void* ctx, void* camera, void* method)) {
         EndCameraRendering_Orig(ctx, camera, method);
         UpdatePhoneSubtitleOverlay();
+
+        if (g_clearUserDataRequested.exchange(false)) {
+            HoshimiLocal::Log::SetClearUserDataResult(ClearUserDataOnce());
+        }
 
         if (Config::enableFreeCamera && mainCameraCache) {
             Unity_set_fieldOfView_Orig(mainCameraCache, IPCamera::baseCamera.fov);
@@ -958,9 +1030,7 @@ namespace HoshimiLocal::HookMain {
         if (!Config::displayUserName.empty()) {
             userName = Il2cppString::New(Config::displayUserName);
         }
-        auto notificationText = MessageDetail_GetNotificationText_Orig(self, userName, mtd);
-        if (!notificationText) return nullptr;
-        return Il2cppString::New(ResolveJosa(notificationText->ToString()));
+        return MessageDetail_GetNotificationText_Orig(self, userName, mtd);
     }
 
     std::unordered_set<void*> updatedFontPtrs{};
@@ -1358,7 +1428,60 @@ namespace HoshimiLocal::HookMain {
         return RestoreJoinedLineBreaks(origText, newStr);
     }
 
+    // ---- In-game server switch: guess the current screen from the UI text paths ----
+    // The first segment of the component path names the screen root (e.g. "Title/...").
+    // The latest probe is always remembered, but the path is computed at most once every 300 ms:
+    // if the throttle skips, the next hook call after the window processes the stored probe
+    // instead of a later screen being lost. All Unity calls stay on the hook (main) thread.
+    void ProbeScreenRoot(void* textComponent) {
+        if (!textComponent) return;
+
+        static auto lastProbe = std::chrono::steady_clock::time_point{};
+        static std::string lastRoot{};
+        static void* pendingProbe = nullptr;
+
+        // Cheap, on every probe: keep only the most recent pending component.
+        pendingProbe = textComponent;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (lastProbe.time_since_epoch().count() != 0 &&
+            now - lastProbe < std::chrono::milliseconds(300)) {
+            // The stored probe is flushed by the next hook call once the window has passed.
+            return;
+        }
+        lastProbe = now;
+
+        void* probe = pendingProbe;
+        pendingProbe = nullptr;
+        if (!probe || !IsNativeObjectAlive(probe)) return;
+
+        std::string path;
+        try {
+            path = GetUnityComponentPath(probe);
+        }
+        catch (...) {
+            return;
+        }
+        if (path.empty() || path[0] == '<') return;
+
+        // Unnamed transforms produce a leading separator.
+        const auto start = path.find_first_not_of('/');
+        if (start == std::string::npos) return;
+        const auto end = path.find('/', start);
+        std::string root =
+            path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        // Drop the " [component=...]" suffix GetUnityComponentPath appends.
+        const auto componentSuffix = root.find(" [component=");
+        if (componentSuffix != std::string::npos) root.erase(componentSuffix);
+        if (root.empty() || root == lastRoot) return;
+
+        lastRoot = root;
+        Log::InfoFmt("ServerSwitch: screen root -> %s", root.c_str());
+        Log::SetScreenRoot(root);
+    }
+
     void ProbeTextComponent(void* textComponent, const std::string& text) {
+        ProbeScreenRoot(textComponent);
         TryApplyLiveHudGeometry(textComponent, text);
         FitOrientationSelectorLabel(textComponent, text);
         if (!Config::debugMasterDbLog || !textComponent) return;
@@ -4990,13 +5113,6 @@ namespace HoshimiLocal::HookMain {
         return Solis_Costume_CheckBulkAsync_Call_Orig(self, request, metadata, deadline, ct, mtd);
     }
 
-    struct SolisUniTask {
-        void* source;
-        int16_t token;
-        int16_t padding0;
-        int32_t padding1;
-    };
-
     SolisUniTask getSolisCompletedUniTask() {
         SolisUniTask ret{};
         static auto unitask_klass = Il2cppUtils::GetClass("UniTask.dll", "Cysharp.Threading.Tasks", "UniTask");
@@ -5401,11 +5517,107 @@ namespace HoshimiLocal::HookMain {
         SolisQualityManager_set_TargetFrameRate_Orig(self, configFps == 0 ? value : (float)configFps);
     }
 
-    DEFINE_HOOK(void, SolisQualityManager_ApplySetting, (void* self)) {
+    struct GraphicQualityState {
+        void* manager = nullptr;
+        int gameQuality = 0;
+        int appliedOverride = -1;
+        bool renderOverride = false;
+        float renderScale = 0.0f;
+        int maxBufferPixel = 0;
+    };
+
+    GraphicQualityState graphicQualityState;
+    bool graphicQualityHooksReady = false;
+
+    UnityResolve::Field* GetGraphicQualityField(const char* name) {
+        static auto qualityClass = Il2cppUtils::GetClass("solis-submodule.Runtime.dll", "Solis.Common", "SolisQualityManager");
+        return qualityClass ? qualityClass->Get<UnityResolve::Field>(name) : nullptr;
+    }
+
+    int GetUnityQualityCount() {
+        static const int count = [] {
+            auto getNames = Il2cppUtils::GetMethod("UnityEngine.CoreModule.dll", "UnityEngine", "QualitySettings", "get_names");
+            if (!getNames) return 0;
+            auto names = getNames->Invoke<UnityResolve::UnityType::Array<Il2cppString*>*>();
+            return names ? static_cast<int>(names->max_length) : 0;
+        }();
+        return count;
+    }
+
+    void TrackGraphicQualityManager(void* self) {
+        if (graphicQualityState.manager == self) return;
+        static auto threeD = GetGraphicQualityField("<ThreeD>k__BackingField");
+        graphicQualityState = {self, threeD ? Il2cppUtils::ClassGetFieldValue<int>(self, threeD) : 0, -1};
+    }
+
+    int GetRequestedGraphicQuality() {
+        if (!graphicQualityHooksReady || !Config::useCustomeGraphicSettings) return 0;
+        const int quality = NormalizeGraphicQuality(Config::graphicQuality);
+        if (quality == 100 && GetUnityQualityCount() == 0) return 0;
+        return quality;
+    }
+
+    DEFINE_HOOK(void, SolisQualityManager_SetQuality, (void* self, int level, void* method)) {
+        TrackGraphicQualityManager(self);
+        graphicQualityState.gameQuality = level;
+        const int requested = GetRequestedGraphicQuality();
+        const int effective = IsGameGraphicQuality(level) && requested != 0 ? requested : level;
+        static auto threeD = GetGraphicQualityField("<ThreeD>k__BackingField");
+        const bool overrideChanged = requested != 0 || graphicQualityState.appliedOverride > 0;
+        if (threeD && overrideChanged && IsGameGraphicQuality(level)) {
+            Il2cppUtils::ClassSetFieldValue(self, threeD, 0);
+        }
+        SolisQualityManager_SetQuality_Orig(self, effective, method);
+        if (threeD && overrideChanged) Il2cppUtils::ClassSetFieldValue(self, threeD, level);
+        graphicQualityState.appliedOverride = requested;
+    }
+
+    DEFINE_HOOK(void, SolisQualityManager_ApplySetting, (void* self, void* method)) {
         if (Config::targetFrameRate != 0) {
             SolisQualityManager_set_TargetFrameRate_Orig(self, Config::targetFrameRate);
         }
-        SolisQualityManager_ApplySetting_Orig(self);
+        static auto unityLevel = GetGraphicQualityField("QualitySettingsLevel");
+        if (unityLevel && GetRequestedGraphicQuality() == 100) {
+            const int level = Il2cppUtils::ClassGetFieldValue<int>(self, unityLevel);
+            Il2cppUtils::ClassSetFieldValue(self, unityLevel, ClampUnityQuality(level, GetUnityQualityCount()));
+        }
+        SolisQualityManager_ApplySetting_Orig(self, method);
+        if (Config::dbgMode && graphicQualityHooksReady) {
+            static auto maxPixels = GetGraphicQualityField("MaxBufferPixel");
+            Log::DebugFmt("GraphicQuality: requested=%d game=%d unity=%d max=%d resolutionOverride=%d",
+                          GetRequestedGraphicQuality(), graphicQualityState.gameQuality,
+                          unityLevel ? Il2cppUtils::ClassGetFieldValue<int>(self, unityLevel) : -1,
+                          maxPixels ? Il2cppUtils::ClassGetFieldValue<int>(self, maxPixels) : -1,
+                          Config::useCustomeGraphicSettings);
+        }
+    }
+
+    DEFINE_HOOK(void, SolisQualityManager_Update, (void* self, void* method)) {
+        TrackGraphicQualityManager(self);
+        const int requested = GetRequestedGraphicQuality();
+        const bool renderOverride = Config::useCustomeGraphicSettings;
+        const float renderScale = std::isfinite(Config::renderScale) ? std::clamp(Config::renderScale, 0.25f, 2.0f) : 1.0f;
+        const int maxPixels = std::clamp(Config::maxBufferPixel, 256, 4096) & ~1;
+        const bool resolutionChanged = renderOverride != graphicQualityState.renderOverride ||
+                (renderOverride && (renderScale != graphicQualityState.renderScale || maxPixels != graphicQualityState.maxBufferPixel));
+        if (graphicQualityHooksReady && (requested != graphicQualityState.appliedOverride || resolutionChanged) &&
+                IsGameGraphicQuality(graphicQualityState.gameQuality)) {
+            const int effective = requested != 0 ? requested : graphicQualityState.gameQuality;
+            static auto threeD = GetGraphicQualityField("<ThreeD>k__BackingField");
+            Il2cppUtils::ClassSetFieldValue(self, threeD, 0);
+            SolisQualityManager_SetQuality_Orig(self, effective, nullptr);
+            Il2cppUtils::ClassSetFieldValue(self, threeD, graphicQualityState.gameQuality);
+            graphicQualityState.appliedOverride = requested;
+            graphicQualityState.renderOverride = renderOverride;
+            graphicQualityState.renderScale = renderScale;
+            graphicQualityState.maxBufferPixel = maxPixels;
+        }
+        SolisQualityManager_Update_Orig(self, method);
+    }
+
+    DEFINE_HOOK(void, SolisQualityManager_OnInitialize, (void* self, void* method)) {
+        graphicQualityState = {};
+        SolisQualityManager_OnInitialize_Orig(self, method);
     }
 
     DEFINE_HOOK(void, UIManager_UpdateRenderTarget, (UnityResolve::UnityType::Vector2 ratio, void* mtd)) {
@@ -5414,17 +5626,175 @@ namespace HoshimiLocal::HookMain {
         return UIManager_UpdateRenderTarget_Orig(ratio, mtd);
     }
 
-    DEFINE_HOOK(void, VLSRPCameraController_UpdateRenderTarget, (void* self, int width, int height, bool forceAlpha, void* method)) {
-        // const auto resolution = GetResolution();
-        // Log::DebugFmt("VLSRPCameraController_UpdateRenderTarget: %d, %d", width, height);
-        return VLSRPCameraController_UpdateRenderTarget_Orig(self, width, height, forceAlpha, method);
+    thread_local void* renderResolutionCamera = nullptr;
+
+    int GetRequestedAntiAliasing() {
+        const int mode = Config::antiAliasingMode;
+        return Config::useCustomeGraphicSettings && mode >= 0 && mode <= 2 ? mode : -1;
     }
 
-    DEFINE_HOOK(void*, VLUtility_GetLimitedResolution, (int32_t screenWidth, int32_t screenHeight,
-            UnityResolve::UnityType::Vector2 aspectRatio, int32_t maxBufferPixel, float bufferScale, bool firstCall)) {
+    void* GetMainGraphicCamera() {
+        static auto getController = Il2cppUtils::GetMethod("vl-unity.Runtime.dll", "VL", "VLCameraController", "get_Instance");
+        static auto controllerClass = Il2cppUtils::GetClass("vl-unity.Runtime.dll", "VL.Rendering", "VLSRPCameraController");
+        static auto getCamera = Il2cppUtils::GetMethod("vl-unity.Runtime.dll", "VL.Rendering", "VLSRPCameraController", "get_mainCamera");
+        if (!getController || !controllerClass || !getCamera) return nullptr;
+        auto controller = getController->Invoke<void*>();
+        if (!controller) return nullptr;
+        auto actualClass = UnityResolve::Invoke<void*>("il2cpp_object_get_class", controller);
+        if (!UnityResolve::Invoke<bool>("il2cpp_class_is_assignable_from", controllerClass->address, actualClass)) return nullptr;
+        return getCamera->Invoke<void*>(controller);
+    }
 
-        //Log::DebugFmt("VLUtility_GetLimitedResolution: %d, %d, %f, %f", screenWidth, screenHeight, aspectRatio.x, aspectRatio.y);
-        return VLUtility_GetLimitedResolution_Orig(screenWidth, screenHeight, aspectRatio, maxBufferPixel, bufferScale, firstCall);
+    int GetUnboxedGraphicsFieldOffset(const char* className, const char* fieldName) {
+        auto klass = Il2cppUtils::GetClass("Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", className);
+        auto field = klass ? klass->Get<UnityResolve::Field>(fieldName) : nullptr;
+        if (!field) return -1;
+        uint32_t alignment = 0;
+        const int size = UnityResolve::Invoke<int>("il2cpp_class_value_size", klass->address, &alignment);
+        const int offset = static_cast<int>(field->offset) - static_cast<int>(sizeof(void*) * 2);
+        return offset >= 0 && size >= static_cast<int>(sizeof(void*)) && offset <= size - static_cast<int>(sizeof(void*)) ? offset : -1;
+    }
+
+    struct GraphicsCameraData {
+        void* camera = nullptr;
+        int mode = -2;
+        int quality = -2;
+    };
+
+    GraphicsCameraData ReadGraphicsCameraData(void* data) {
+        static const int cameraOffset = GetUnboxedGraphicsFieldOffset("CameraData", "camera");
+        static const int modeOffset = GetUnboxedGraphicsFieldOffset("CameraData", "antialiasing");
+        static const int qualityOffset = GetUnboxedGraphicsFieldOffset("CameraData", "antialiasingQuality");
+        if (!data || cameraOffset < 0 || modeOffset < 0 || qualityOffset < 0) return {};
+        auto bytes = static_cast<const uint8_t*>(data);
+        GraphicsCameraData result;
+        memcpy(&result.camera, bytes + cameraOffset, sizeof(result.camera));
+        memcpy(&result.mode, bytes + modeOffset, sizeof(result.mode));
+        memcpy(&result.quality, bytes + qualityOffset, sizeof(result.quality));
+        return result;
+    }
+
+
+    DEFINE_HOOK(bool, ActorShadowPass_UpdateShadowData,
+                (void* self, void* renderingData, void** settings, int resolution, void* method)) {
+        const int requested = Config::useCustomeGraphicSettings ? NormalizeShadowResolution(Config::shadowResolution) : 0;
+        if (requested > 0 && renderingData) {
+            static const int cameraOffset = GetUnboxedGraphicsFieldOffset("RenderingData", "cameraData");
+            static auto getMaxSize = Il2cppUtils::GetMethod("UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo", "get_maxTextureSize");
+            if (cameraOffset >= 0 && getMaxSize) {
+                auto camera = ReadGraphicsCameraData(static_cast<uint8_t*>(renderingData) + cameraOffset).camera;
+                if (camera && camera == GetMainGraphicCamera() && requested <= getMaxSize->Invoke<int>()) {
+                    resolution = requested;
+                }
+            }
+        }
+        return ActorShadowPass_UpdateShadowData_Orig(self, renderingData, settings, resolution, method);
+    }
+
+    DEFINE_HOOK(void, UniversalRenderPipeline_InitializeCameraData,
+                (void* camera, void* additionalData, bool resolveFinalTarget, void* cameraData, void* method)) {
+        const int requested = GetRequestedAntiAliasing();
+        if ((!Config::dbgMode && requested < 0) || !camera || !additionalData || camera != GetMainGraphicCamera()) {
+            return UniversalRenderPipeline_InitializeCameraData_Orig(camera, additionalData, resolveFinalTarget, cameraData, method);
+        }
+        static auto cameraClass = Il2cppUtils::GetClass("Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", "UniversalAdditionalCameraData");
+        static auto modeField = cameraClass ? cameraClass->Get<UnityResolve::Field>("m_Antialiasing") : nullptr;
+        static auto qualityField = cameraClass ? cameraClass->Get<UnityResolve::Field>("m_AntialiasingQuality") : nullptr;
+        static auto postField = cameraClass ? cameraClass->Get<UnityResolve::Field>("m_RenderPostProcessing") : nullptr;
+        static auto renderTypeField = cameraClass ? cameraClass->Get<UnityResolve::Field>("m_CameraType") : nullptr;
+        if (!modeField || !qualityField || !postField || !renderTypeField ||
+                Il2cppUtils::ClassGetFieldValue<int>(additionalData, renderTypeField) != 0) {
+            return UniversalRenderPipeline_InitializeCameraData_Orig(camera, additionalData, resolveFinalTarget, cameraData, method);
+        }
+        const bool postEnabled = Il2cppUtils::ClassGetFieldValue<bool>(additionalData, postField);
+        const int originalMode = Il2cppUtils::ClassGetFieldValue<int>(additionalData, modeField);
+        const int originalQuality = Il2cppUtils::ClassGetFieldValue<int>(additionalData, qualityField);
+        struct CameraAntiAliasingScope {
+            void* data;
+            UnityResolve::Field* modeField;
+            UnityResolve::Field* qualityField;
+            int mode;
+            int quality;
+            ~CameraAntiAliasingScope() {
+                Il2cppUtils::ClassSetFieldValue(data, modeField, mode);
+                Il2cppUtils::ClassSetFieldValue(data, qualityField, quality);
+            }
+        } scope{additionalData, modeField, qualityField, originalMode, originalQuality};
+        if (requested >= 0 && (postEnabled || requested == 0)) {
+            Il2cppUtils::ClassSetFieldValue(additionalData, modeField, requested);
+            if (requested == 2) Il2cppUtils::ClassSetFieldValue(additionalData, qualityField, 2);
+        }
+        UniversalRenderPipeline_InitializeCameraData_Orig(camera, additionalData, resolveFinalTarget, cameraData, method);
+        if (Config::dbgMode) {
+            static void* lastCamera = nullptr;
+            static int lastRequested = -3;
+            static int lastMode = -3;
+            static bool lastPost = false;
+            const auto result = ReadGraphicsCameraData(cameraData);
+            if (camera != lastCamera || requested != lastRequested || result.mode != lastMode || postEnabled != lastPost) {
+                Log::DebugFmt("AntiAliasing: camera=%p requested=%d original=%d effective=%d quality=%d post=%d cameraDataValid=%d",
+                              camera, requested, originalMode, result.mode, result.quality, postEnabled, result.camera == camera);
+                lastCamera = camera;
+                lastRequested = requested;
+                lastMode = result.mode;
+                lastPost = postEnabled;
+            }
+        }
+    }
+
+    DEFINE_HOOK(void, VLSRPCameraController_UpdateRenderTarget, (void* self, int width, int height, bool forceAlpha, void* method)) {
+        if (!self || (width > 0 && height > 0)) {
+            return VLSRPCameraController_UpdateRenderTarget_Orig(self, width, height, forceAlpha, method);
+        }
+        static auto cameraClass = Il2cppUtils::GetClass("vl-unity.Runtime.dll", "VL.Rendering", "VLSRPCameraController");
+        static auto dynamicScaleField = cameraClass ? cameraClass->Get<UnityResolve::Field>("useDynamicScale") : nullptr;
+        static auto destroyTarget = cameraClass ? cameraClass->Get<UnityResolve::Method>("DestroyTargetTexture") : nullptr;
+        static auto getInstanceId = Il2cppUtils::GetMethod("UnityEngine.CoreModule.dll", "UnityEngine", "Object", "GetInstanceID");
+        if (!dynamicScaleField || !destroyTarget || !getInstanceId) {
+            return VLSRPCameraController_UpdateRenderTarget_Orig(self, width, height, forceAlpha, method);
+        }
+        static std::unordered_map<int32_t, bool> resolutionModes;
+        const auto instanceId = getInstanceId->Invoke<int32_t>(self);
+        const auto previousMode = resolutionModes.find(instanceId);
+        const bool rebuild = previousMode == resolutionModes.end()
+                ? Config::useCustomeGraphicSettings
+                : previousMode->second != Config::useCustomeGraphicSettings;
+        if (resolutionModes.size() > 128) resolutionModes.clear();
+        resolutionModes[instanceId] = Config::useCustomeGraphicSettings;
+        if (rebuild) destroyTarget->Invoke<void>(self);
+        if (!Config::useCustomeGraphicSettings) {
+            return VLSRPCameraController_UpdateRenderTarget_Orig(self, width, height, forceAlpha, method);
+        }
+        struct ResolutionScope {
+            void* camera;
+            void* previousCamera;
+            UnityResolve::Field* dynamicScaleField;
+            bool dynamicScale;
+
+            ~ResolutionScope() {
+                renderResolutionCamera = previousCamera;
+                Il2cppUtils::ClassSetFieldValue(camera, dynamicScaleField, dynamicScale);
+            }
+        } scope{self, renderResolutionCamera, dynamicScaleField,
+                Il2cppUtils::ClassGetFieldValue<bool>(self, dynamicScaleField)};
+        renderResolutionCamera = self;
+        Il2cppUtils::ClassSetFieldValue(self, dynamicScaleField, false);
+        VLSRPCameraController_UpdateRenderTarget_Orig(self, width, height, forceAlpha, method);
+    }
+
+    DEFINE_HOOK(RenderResolution, VLUtility_GetLimitedResolution, (int32_t screenWidth, int32_t screenHeight,
+            UnityResolve::UnityType::Vector2 aspectRatio, int32_t maxBufferPixel, float bufferScale, bool firstCall, void* method)) {
+        if (!renderResolutionCamera || !firstCall || !Config::useCustomeGraphicSettings) {
+            return VLUtility_GetLimitedResolution_Orig(screenWidth, screenHeight, aspectRatio, maxBufferPixel, bufferScale, firstCall, method);
+        }
+        const auto base = VLUtility_GetLimitedResolution_Orig(screenWidth, screenHeight, aspectRatio, 0, 1.0f, firstCall, method);
+        const auto result = ScaleRenderResolution(base, Config::renderScale, Config::maxBufferPixel);
+        if (Config::dbgMode || Config::debugImageResourceLog) {
+            Log::DebugFmt("RenderResolution: camera=%p screen=%dx%d base=%dx%d result=%dx%d scale=%.3f max=%d dynamic=off",
+                          renderResolutionCamera, screenWidth, screenHeight, base.width, base.height,
+                          result.width, result.height, Config::renderScale, Config::maxBufferPixel);
+        }
+        return result;
     }
 
     bool InitBodyParts() {
@@ -5550,77 +5920,6 @@ namespace HoshimiLocal::HookMain {
         SolisActorController_LateUpdate_Orig(self, mtd);
     }
 
-    DEFINE_HOOK(bool, PlatformInformation_get_IsAndroid, ()) {
-        if (Config::loginAsIOS) {
-            return false;
-        }
-        // Log::DebugFmt("PlatformInformation_get_IsAndroid: 0x%x", ret);
-        return PlatformInformation_get_IsAndroid_Orig();
-    }
-
-    DEFINE_HOOK(bool, PlatformInformation_get_IsIOS, ()) {
-        if (Config::loginAsIOS) {
-            return true;
-        }
-        // Log::DebugFmt("PlatformInformation_get_IsIOS: 0x%x", ret);
-        return PlatformInformation_get_IsIOS_Orig();
-    }
-
-    DEFINE_HOOK(Il2cppString*, ApiBase_GetPlatformString, (void* self, void* mtd)) {
-        if (Config::loginAsIOS) {
-            return Il2cppString::New("iOS");
-        }
-        // Log::DebugFmt("ApiBase_GetPlatformString: %s", ret->ToString().c_str());
-        return ApiBase_GetPlatformString_Orig(self, mtd);
-    }
-
-    void ProcessApiBase(void* self) {
-        static void* processedIOS = nullptr;
-
-        if (Config::loginAsIOS) {
-            if (self == processedIOS) return;
-
-            static auto ApiBase_klass = Il2cppUtils::get_class_from_instance(self);
-            static auto platform_field = UnityResolve::Invoke<Il2cppUtils::FieldInfo*>("il2cpp_class_get_field_from_name", ApiBase_klass, "_platform");
-             auto platform = Il2cppUtils::ClassGetFieldValue<Il2cppString*>(self, platform_field);
-             Log::DebugFmt("ProcessApiBase platform: %s", platform ? platform->ToString().c_str() : "null");
-             if (platform) {
-                 const auto origPlatform = platform->ToString();
-                 if (origPlatform != "iOS") {
-                     Il2cppUtils::ClassSetFieldValue(self, platform_field, Il2cppString::New("iOS"));
-                     processedIOS = self;
-                 }
-             }
-             else {
-                 Il2cppUtils::ClassSetFieldValue(self, platform_field, Il2cppString::New("iOS"));
-                 processedIOS = self;
-             }
-        }
-        else {
-            if (processedIOS) {
-                Log::DebugFmt("Restore API");
-                static auto ApiBase_klass = Il2cppUtils::get_class_from_instance(self);
-                static auto platform_field = UnityResolve::Invoke<Il2cppUtils::FieldInfo*>("il2cpp_class_get_field_from_name", ApiBase_klass, "_platform");
-
-                Il2cppUtils::ClassSetFieldValue(self, platform_field, Il2cppString::New("Android"));
-                processedIOS = nullptr;
-            }
-        }
-    }
-
-    DEFINE_HOOK(void, ApiBase_ctor, (void* self, void* mtd)) {
-        ApiBase_ctor_Orig(self, mtd);
-        ProcessApiBase(self);
-    }
-
-    DEFINE_HOOK(void*, ApiBase_get_Instance, (void* mtd)) {
-        auto ret = ApiBase_get_Instance_Orig(mtd);
-        if (ret) {
-            ProcessApiBase(ret);
-        }
-        return ret;
-    }
-
 #if ENABLE_BREAST_PARAM
     void UpdateSolisSwingBreastBones(void* breastBones) {
         if (!Config::enableBreastParam || !breastBones) return;
@@ -5714,7 +6013,7 @@ namespace HoshimiLocal::HookMain {
     void StartInjectFunctions() {
         const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
 
-        UnityResolve::Init(xdl_open(hookInstaller->m_il2cppLibraryPath.c_str(), RTLD_NOW),
+        UnityResolve::Init(hookInstaller->GetIl2CppLibraryHandle(),
             UnityResolve::Mode::Il2Cpp, Config::lazyInit);
 
         ADD_HOOK(AssetBundle_LoadAssetAsync, Il2cppUtils::il2cpp_resolve_icall(
@@ -6178,12 +6477,12 @@ namespace HoshimiLocal::HookMain {
         ADD_HOOK(VLSRPCameraController_UpdateRenderTarget,
                  Il2cppUtils::GetMethodPointer("vl-unity.Runtime.dll", "VL.Rendering",
                                                "VLSRPCameraController", "UpdateRenderTarget",
-                                               {"*", "*", "*"}));
+                                               {"System.Int32", "System.Int32", "System.Boolean"}));
 
         ADD_HOOK(VLUtility_GetLimitedResolution,
                  Il2cppUtils::GetMethodPointer("vl-unity.Runtime.dll", "VL",
                                                "VLUtility", "GetLimitedResolution",
-                                               {"*", "*", "*", "*", "*", "*"}));
+                                               {"System.Int32", "System.Int32", "UnityEngine.Vector2", "System.Int32", "System.Single", "System.Boolean"}));
 
         ADD_HOOK(SolisActorController_LateUpdate,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
@@ -6202,29 +6501,31 @@ namespace HoshimiLocal::HookMain {
         }
 #endif
 
-        ADD_HOOK(PlatformInformation_get_IsAndroid, Il2cppUtils::GetMethodPointer("Firebase.Platform.dll", "Firebase.Platform",
-                                                                         "PlatformInformation", "get_IsAndroid"));
-        ADD_HOOK(PlatformInformation_get_IsIOS, Il2cppUtils::GetMethodPointer("Firebase.Platform.dll", "Firebase.Platform",
-                                                                                  "PlatformInformation", "get_IsIOS"));
-
-        auto api_klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.Common.Network", "Api");
-        if (api_klass) {
-            // Qua.Network.ApiBase
-            auto api_parent = UnityResolve::Invoke<Il2cppUtils::Il2CppClassHead*>("il2cpp_class_get_parent", api_klass->address);
-            if (api_parent) {
-                // Log::DebugFmt("api_parent at %p, name: %s::%s", api_parent, api_parent->namespaze, api_parent->name);
-                ADD_HOOK(ApiBase_GetPlatformString, Il2cppUtils::il2cpp_class_get_method_pointer_from_name(api_parent, "GetPlatformString", 0));
-                ADD_HOOK(ApiBase_ctor, Il2cppUtils::il2cpp_class_get_method_pointer_from_name(api_parent, ".ctor", 0));
-                ADD_HOOK(ApiBase_get_Instance, Il2cppUtils::il2cpp_class_get_method_pointer_from_name(api_parent, "get_Instance", 0));
-            }
-        }
+        PrivateServer::Install(hookInstaller);
 
         ADD_HOOK(SolisQualityManager_set_TargetFrameRate,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
                                                "SolisQualityManager", "set_TargetFrameRate"));
+        ADD_HOOK(UniversalRenderPipeline_InitializeCameraData,
+                 Il2cppUtils::GetMethodPointer("Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal",
+                                               "UniversalRenderPipeline", "InitializeCameraData",
+                                               {"UnityEngine.Camera", "UnityEngine.Rendering.Universal.UniversalAdditionalCameraData", "System.Boolean", "UnityEngine.Rendering.Universal.CameraData&"}));
+        ADD_HOOK(ActorShadowPass_UpdateShadowData, Il2cppUtils::GetMethodPointer("vl-unity-srp.Runtime.dll", "VL.Rendering", "ActorShadowPass", "UpdateShadowData"));
         ADD_HOOK(SolisQualityManager_ApplySetting,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
                                                "SolisQualityManager", "ApplySetting"));
+        ADD_HOOK(SolisQualityManager_SetQuality,
+                 Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
+                                               "SolisQualityManager", "SetQuality", {"SolisQualityManager.QualityLevel"}));
+        ADD_HOOK(SolisQualityManager_Update,
+                 Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
+                                               "SolisQualityManager", "Update"));
+        ADD_HOOK(SolisQualityManager_OnInitialize,
+                 Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
+                                               "SolisQualityManager", "OnInitialize"));
+        graphicQualityHooksReady = SolisQualityManager_SetQuality_Orig && SolisQualityManager_ApplySetting_Orig &&
+                SolisQualityManager_Update_Orig && SolisQualityManager_OnInitialize_Orig &&
+                GetGraphicQualityField("<ThreeD>k__BackingField") && GetGraphicQualityField("QualitySettingsLevel");
 
         ADD_HOOK(Internal_LogException, Il2cppUtils::il2cpp_resolve_icall(
                 "UnityEngine.DebugLogHandler::Internal_LogException(System.Exception,UnityEngine.Object)"));
@@ -6245,6 +6546,38 @@ namespace HoshimiLocal::HookMain {
         ADD_HOOK(InternalSetOrientationAsync,
             Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
                 "ScreenOrientationControllerBase", "InternalSetOrientationAsync"));
+
+        // Solis.Title.TitlePresenter is the authoritative title-screen signal for the switch button.
+        // A missing method only warns; the screen-root probe keeps working as a fallback.
+        const auto titleStartAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "Start");
+        if (titleStartAddr) {
+            ADD_HOOK(TitlePresenter_Start, titleStartAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt(
+                    "ServerSwitch: TitlePresenter.Start not found; using screen roots only");
+        }
+
+        const auto titleMoveOutAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "MoveOutGameAsync",
+                {"System.Threading.CancellationToken"});
+        if (titleMoveOutAddr) {
+            ADD_HOOK(TitlePresenter_MoveOutGameAsync, titleMoveOutAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt(
+                    "ServerSwitch: TitlePresenter.MoveOutGameAsync not found");
+        }
+
+        const auto titleOnDestroyAddr = Il2cppUtils::GetMethodPointer(
+                "Assembly-CSharp.dll", "Solis.Title", "TitlePresenter", "OnDestroy");
+        if (titleOnDestroyAddr) {
+            ADD_HOOK(TitlePresenter_OnDestroy, titleOnDestroyAddr);
+        }
+        else {
+            HoshimiLocal::Log::InfoFmt("ServerSwitch: TitlePresenter.OnDestroy not found");
+        }
 
         ADD_HOOK(Unity_set_position_Injected, Il2cppUtils::il2cpp_resolve_icall(
                 "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)"));
@@ -6307,6 +6640,12 @@ namespace HoshimiLocal::HookMain {
 
 
 namespace HoshimiLocal::Hook {
+    std::string LocalizeNotificationText(std::string text, const std::string& userName) {
+        std::string translated;
+        if (Local::GetGenericText(text, &translated)) text = std::move(translated);
+        return HookMain::ResolveJosa(Config::ReplaceDisplayUserName(std::move(text), userName));
+    }
+
     void Install() {
         const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
 

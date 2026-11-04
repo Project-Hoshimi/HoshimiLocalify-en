@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace HoshimiLocal::Config {
     extern bool isConfigInit;
 
@@ -31,11 +33,17 @@ namespace HoshimiLocal::Config {
     extern std::string liveCustomeHeadId;
     extern std::string liveCustomeCostumeId;
 
-    extern bool loginAsIOS;
+
+    extern bool privateServerEnabled;
+    extern std::string privateServerUrl;
+    extern std::string privateServerCaPem;
 
     extern bool useCustomeGraphicSettings;
     extern float renderScale;
     extern int qualitySettingsLevel;
+    extern int graphicQuality;
+    extern int antiAliasingMode;
+    extern int shadowResolution;
     extern int volumeIndex;
     extern int maxBufferPixel;
 
@@ -64,6 +72,7 @@ namespace HoshimiLocal::Config {
     extern bool dmmUnlockSize;
 
     std::string ReplaceDisplayUserName(std::string text);
+    std::string ReplaceDisplayUserName(std::string text, const std::string& userName);
     void LoadConfig(const std::string& configStr);
     void SaveConfig(const std::string& configPath);
 }

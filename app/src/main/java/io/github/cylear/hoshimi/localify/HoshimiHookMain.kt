@@ -75,6 +75,40 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
 
+        mainProcess = lpparam.processName == lpparam.packageName
+
+        // In-game server selection state lives in the game's own sandbox. A pending switch is
+        // consumed here, before Firebase's ContentProvider in the new process reads its auth store.
+        // Only the main process may touch the shared account files.
+        try {
+            val dataDir = lpparam.appInfo?.dataDir
+            if (dataDir != null) {
+                val dir = File(dataDir)
+                ServerProfileStore.migrateLegacyCacheIfPresent(dir)
+                if (mainProcess) {
+                    // Only a legacy journal left by an older build is consumed; new switches never
+                    // create pending.json. A clear-pending marker wipes the account files instead.
+                    ServerProfileStore.swapPendingAccount(dir)
+                    ServerProfileStore.consumeClearPending(dir)
+                }
+            }
+        }
+        catch (t: Throwable) {
+            Log.e(TAG, "ServerProfileStore: early server switch handling failed", t)
+        }
+
+        // Installed before the process runs any game code: libunity.so resolves the UnityTLS root
+        // list over JNI (TrustManagerFactory.getTrustManagers -> getAcceptedIssuers) and caches it,
+        // so the hooks must exist before the Unity player starts networking.
+        PrivateServerTrust.install(lpparam.classLoader)
+
+        // Local notifications for idol messages/calls (the official game used FCM pushes).
+        NarrativeNotifier.install(lpparam.classLoader)
+
+        if (nativeLibLoadSuccess) {
+            NotificationTranslationHook.install(lpparam.packageName)
+        }
+
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
@@ -142,6 +176,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 Log.d(TAG, "onStart")
                 val currActivity = param.thisObject as Activity
                 gameActivity = currActivity
+                activityResumed = false
                 if (getConfigError != null) {
                     showGetConfigFailed(currActivity)
                 }
@@ -156,11 +191,19 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 Log.d(TAG, "onResume")
                 val currActivity = param.thisObject as Activity
                 gameActivity = currActivity
+                activityResumed = true
                 if (getConfigError != null) {
                     showGetConfigFailed(currActivity)
                 }
                 else {
                     initIprConfig(currActivity)
+                }
+                try {
+                    ServerSwitchOverlay.attach(currActivity)
+                    maybeShowFirstLaunch(currActivity)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerSwitch: cannot prepare the server UI", t)
                 }
             }
         })
@@ -259,6 +302,48 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             catch (e: Exception) {
                 null
             }
+            // The module app only suggests servers; the in-game picker owns the active one.
+            // Only the game's main process maintains the shared suggestion file.
+            if (initConfig != null && mainProcess) {
+                ServerProfileStore.updateSuggestedServers(activity.filesDir, initConfig.suggestedServerUrls)
+            }
+            // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
+            // configuration is seen (usually a no-op, the launch intent already delivered it).
+            // A malformed payload decodes to null and is ignored by the trust layer.
+            if (initConfig != null) {
+                try {
+                    // A config that enables a private server becomes a profile on first sight, so a
+                    // later switch can come back to it with the same account.
+                    ServerProfileStore.migrateFromAppConfig(activity.filesDir, initConfig)
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot migrate the app configuration", t)
+                }
+            }
+            // The app's private-server setting wins only when it enables one; otherwise the
+            // in-game active profile decides, and native must see that same decision.
+            var effectiveIprData = iprData
+            // "standalone-*" tells the trust layer this config is the active profile, not an
+            // app configuration that enables the private server.
+            var observeSource = "iprData"
+            if (initConfig != null && !initConfig.privateServerEnabled) {
+                try {
+                    ServerProfileStore.applyActiveProfile(initConfig, activity.filesDir)
+                    effectiveIprData = json.encodeToString(IdolyprideConfig.serializer(), initConfig)
+                    observeSource = "standalone-profile-over-app"
+                    Log.i(TAG, "ServerProfileStore: native config follows the active profile " +
+                            "(private=${initConfig.privateServerEnabled})")
+                }
+                catch (t: Throwable) {
+                    Log.w(TAG, "ServerProfileStore: cannot apply the active profile to the app config", t)
+                }
+            }
+            try {
+                PrivateServerTrust.observeConfig(initConfig, observeSource)
+            }
+            catch (t: Throwable) {
+                Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA from iprData", t)
+            }
             val programConfig = try {
                 if (programData == null) {
                     ProgramConfig()
@@ -312,9 +397,11 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
             }
 
-            loadConfig(iprData)
+            loadConfig(effectiveIprData)
+            if (initConfig != null) NotificationLocalizer.updateConfig(activity, initConfig)
             Log.d(TAG, "iprData: $iprData")
             checkTranslationUpdate(activity)
+            afterConfigResolved(activity)
         }
     }
 
@@ -389,8 +476,58 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         iprDataInited = true
         FilesChecker.initAndCheck(context.filesDir, modulePath)
-        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), IdolyprideConfig()))
+        val defaultConfig = IdolyprideConfig()
+        // No module app answered the config request, so the in-game server profile decides whether
+        // the private server is used (official by default).
+        try {
+            ServerProfileStore.applyActiveProfile(defaultConfig, context.filesDir)
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "ServerProfileStore: cannot read the active server profile", t)
+        }
+        loadConfig(json.encodeToString(IdolyprideConfig.serializer(), defaultConfig))
+        // Arm the profile's CA (if any) for this process; an official profile clears it.
+        try {
+            PrivateServerTrust.observeConfig(defaultConfig, "standalone-profile")
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "PrivateServerTrust: cannot apply the private server CA in standalone mode", t)
+        }
+        NotificationLocalizer.updateConfig(context, defaultConfig)
         Log.i(TAG, "Loaded default configuration in standalone mode.")
+        afterConfigResolved(context as? Activity ?: gameActivity)
+    }
+
+    /**
+     * Latch for the first-launch picker: the prompt must wait until the app configuration was
+     * actually resolved, so it can see a profiled server chosen through the module app.
+     */
+    private fun afterConfigResolved(activity: Activity?) {
+        configResolved = true
+        val current = activity ?: gameActivity
+        if (current != null && activityResumed) {
+            maybeShowFirstLaunch(current)
+        }
+    }
+
+    private fun maybeShowFirstLaunch(activity: Activity) {
+        if (!mainProcess || !configResolved || firstLaunchPromptHandled) return
+        try {
+            if (ServerProfileStore.appManagedPrivateServer) return
+            if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
+            firstLaunchPromptHandled = true
+            activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    // Let the next resumed activity try again instead of losing the prompt.
+                    firstLaunchPromptHandled = false
+                    return@runOnUiThread
+                }
+                ServerPromptDialog.maybeShowFirstLaunch(activity)
+            }
+        }
+        catch (t: Throwable) {
+            Log.w(TAG, "ServerSwitch: cannot schedule the first-launch server prompt", t)
+        }
     }
 
     private fun checkPluginVersion(activity: Activity, readVersion: String?) {
@@ -534,6 +671,22 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     companion object {
+        /**
+         * The first-launch server prompt waits for configuration resolution and is evaluated at
+         * most once per process. The account swap and the prompt only run in the main process.
+         */
+        @Volatile
+        private var mainProcess = false
+
+        @Volatile
+        private var configResolved = false
+
+        @Volatile
+        private var activityResumed = false
+
+        @Volatile
+        private var firstLaunchPromptHandled = false
+
         @JvmStatic
         external fun initHook(targetLibraryPath: String, localizationFilesDir: String)
         @JvmStatic
@@ -552,6 +705,14 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
         )
         @JvmStatic
         external fun loadConfig(configJsonStr: String)
+
+        /** Asks native to run the game's own Delete Data routine on the Unity main thread. */
+        @JvmStatic
+        external fun requestClearUserData()
+
+        /** Game JWT captured from the login response; empty until the first login. */
+        @JvmStatic
+        external fun getGameAuthToken(): String
 
         // Toast fast switch content
         private var toast: Toast? = null
@@ -578,6 +739,27 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         @JvmStatic
         external fun pluginCallbackLooper(): Int
+
+        /**
+         * Reported from the native text-probe path whenever the top of the current Unity screen
+         * hierarchy changes; drives the "Switch server" overlay visibility.
+         */
+        @JvmStatic
+        fun onScreenRootChanged(root: String) {
+            ServerSwitchOverlay.onScreenRootChanged(root)
+        }
+
+        /** Result of [requestClearUserData], delivered from the native callback loop. */
+        @JvmStatic
+        fun onClearUserDataDone(success: Boolean) {
+            ServerProfileStore.onClearUserDataDone(success)
+        }
+
+        /** Reported from the native `TitlePresenter` hooks; drives the switch-button visibility. */
+        @JvmStatic
+        fun onTitleScreenChanged(visible: Boolean) {
+            ServerSwitchOverlay.onTitleScreenChanged(visible)
+        }
     }
 
     init {

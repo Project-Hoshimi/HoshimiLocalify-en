@@ -1,19 +1,26 @@
 #include "HoshimiLocalify/Plugin.h"
 #include "HoshimiLocalify/Log.h"
 #include "HoshimiLocalify/Local.h"
+#include "HoshimiLocalify/Hook.h"
+#include "HoshimiLocalify/Misc.hpp"
 
 #include <jni.h>
 #include <android/log.h>
+#include <atomic>
 #include "string"
 #include "shadowhook.h"
 #include "xdl.h"
 #include "HoshimiLocalify/camera/camera.hpp"
 #include "HoshimiLocalify/config/Config.hpp"
+#include "HoshimiLocalify/PrivateServer.hpp"
 #include "Joystick/JoystickEvent.h"
 
 JavaVM* g_javaVM = nullptr;
 jclass g_hoshimiHookMainClass = nullptr;
 jmethodID showToastMethodId = nullptr;
+
+// Set by HoshimiHookMain.requestClearUserData; consumed on the Unity main thread by Hook.cpp.
+std::atomic<bool> g_clearUserDataRequested{false};
 
 bool UnityResolveProgress::startInit = false;
 UnityResolveProgress::Progress UnityResolveProgress::assembliesProgress{};
@@ -25,9 +32,8 @@ namespace
     {
     public:
         explicit AndroidHookInstaller(const std::string& il2cppLibraryPath, const std::string& localizationFilesDir)
-                : m_Il2CppLibrary(xdl_open(il2cppLibraryPath.c_str(), RTLD_LAZY))
+                : m_Il2CppLibrary(xdl_open(il2cppLibraryPath.c_str(), XDL_TRY_FORCE_LOAD))
         {
-            this->m_il2cppLibraryPath = il2cppLibraryPath;
             this->localizationFilesDir = localizationFilesDir;
         }
 
@@ -47,6 +53,11 @@ namespace
             return reinterpret_cast<HoshimiLocal::OpaqueFunctionPointer>(xdl_sym(m_Il2CppLibrary, name, NULL));
         }
 
+        void* GetIl2CppLibraryHandle() const override
+        {
+            return m_Il2CppLibrary;
+        }
+
     private:
         void* m_Il2CppLibrary;
     };
@@ -57,6 +68,55 @@ JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_javaVM = vm;
     return JNI_VERSION_1_6;
+}
+
+extern "C"
+JNIEXPORT jobjectArray JNICALL
+Java_io_github_cylear_hoshimi_localify_NotificationLocalizer_translateTexts(
+        JNIEnv* env, jclass clazz, jstring basePath, jstring userName, jobjectArray texts) {
+    if (!basePath || !texts) return texts;
+    try {
+        auto readString = [env](jstring value) {
+            if (!value) return std::string{};
+            std::u16string text(env->GetStringLength(value), u'\0');
+            env->GetStringRegion(value, 0, static_cast<jsize>(text.size()), reinterpret_cast<jchar*>(text.data()));
+            if (env->ExceptionCheck()) return std::string{};
+            return HoshimiLocal::Misc::ToUTF8(text);
+        };
+        const auto path = readString(basePath);
+        const auto displayName = readString(userName);
+        if (env->ExceptionCheck() || !HoshimiLocal::Local::EnsureNotificationData(path)) return texts;
+
+        const auto length = env->GetArrayLength(texts);
+        auto stringClass = env->FindClass("java/lang/String");
+        if (!stringClass) return nullptr;
+        auto output = env->NewObjectArray(length, stringClass, nullptr);
+        env->DeleteLocalRef(stringClass);
+        if (!output) return nullptr;
+        for (jsize index = 0; index < length; ++index) {
+            auto original = static_cast<jstring>(env->GetObjectArrayElement(texts, index));
+            if (env->ExceptionCheck()) return nullptr;
+            if (!original) continue;
+            const auto text = readString(original);
+            if (env->ExceptionCheck()) return nullptr;
+            const auto localized = HoshimiLocal::Hook::LocalizeNotificationText(text, displayName);
+            if (localized == text) {
+                env->SetObjectArrayElement(output, index, original);
+            } else {
+                const auto utf16 = HoshimiLocal::Misc::ToUTF16(localized);
+                auto replacement = env->NewString(reinterpret_cast<const jchar*>(utf16.data()), static_cast<jsize>(utf16.size()));
+                if (!replacement) return nullptr;
+                env->SetObjectArrayElement(output, index, replacement);
+                env->DeleteLocalRef(replacement);
+            }
+            env->DeleteLocalRef(original);
+            if (env->ExceptionCheck()) return nullptr;
+        }
+        return output;
+    } catch (const std::exception& exception) {
+        HoshimiLocal::Log::ErrorFmt("Notification translation failed: %s", exception.what());
+        return texts;
+    }
 }
 
 extern "C"
@@ -126,10 +186,28 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, j
 }
 
 extern "C"
+JNIEXPORT void JNICALL
+Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_requestClearUserData(JNIEnv *env,
+                                                                             jclass clazz) {
+    g_clearUserDataRequested.store(true);
+    HoshimiLocal::Log::Info("ServerSwitch: clear user data requested");
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_getGameAuthToken(JNIEnv *env, jclass clazz) {
+    const std::string token = HoshimiLocal::PrivateServer::GetAuthToken();
+    return env->NewStringUTF(token.c_str());
+}
+
+extern "C"
 JNIEXPORT jint JNICALL
 Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIEnv *env,
                                                                              jclass clazz) {
     // HoshimiLocal::Log::ToastLoop(env, clazz);
+    HoshimiLocal::Log::ScreenRootLoop(env, clazz);
+    HoshimiLocal::Log::TitleScreenLoop(env, clazz);
+    HoshimiLocal::Log::ClearUserDataLoop(env, clazz);
 
     if (UnityResolveProgress::startInit) {
         return 9;
