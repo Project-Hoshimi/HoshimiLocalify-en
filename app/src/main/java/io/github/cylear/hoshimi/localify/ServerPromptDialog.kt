@@ -132,6 +132,23 @@ object ServerPromptDialog {
             group.addView(radio, matchWidth())
         }
 
+        val suggestionUrls = HashMap<Int, String>()
+        val knownIds = profiles.map { it.id }.toMutableSet()
+        for (suggestion in ServerProfileStore.readSuggestedServers(filesDir)) {
+            val address = ServerProfileStore.parseServerAddress(suggestion) ?: continue
+            val profileId = ServerProfileStore.profileIdFor(address.url)
+            if (profileId in knownIds) continue
+            knownIds += profileId
+            val radio = RadioButton(activity).apply {
+                id = View.generateViewId()
+                text = "$suggestion (from app)"
+                textSize = 16f
+                setPadding(0, dp(activity, 6), 0, dp(activity, 6))
+            }
+            suggestionUrls[radio.id] = suggestion
+            group.addView(radio, matchWidth())
+        }
+
         val addRadio = RadioButton(activity).apply {
             id = View.generateViewId()
             text = ADD_PROFILE_LABEL
@@ -144,6 +161,17 @@ object ServerPromptDialog {
             try {
                 if (checkedId == addRadio.id) {
                     promptForUrl(activity, dialog, initial = "")
+                    return@setOnCheckedChangeListener
+                }
+                val suggestionUrl = suggestionUrls[checkedId]
+                if (suggestionUrl != null) {
+                    val parsed = ServerProfileStore.parseServerInput(suggestionUrl)
+                    if (parsed == null) {
+                        promptForUrl(activity, dialog, initial = suggestionUrl)
+                    }
+                    else {
+                        startBootstrap(activity, parsed, suggestionUrl, dialog)
+                    }
                     return@setOnCheckedChangeListener
                 }
                 val profileId = profileIds[checkedId] ?: return@setOnCheckedChangeListener

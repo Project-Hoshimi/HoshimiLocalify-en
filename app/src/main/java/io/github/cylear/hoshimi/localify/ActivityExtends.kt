@@ -2,6 +2,7 @@ package io.github.cylear.hoshimi.localify
 
 import android.app.Activity
 import android.content.Intent
+import android.util.Log
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import io.github.cylear.hoshimi.localify.hookUtils.FilesChecker
@@ -21,6 +22,16 @@ interface IHasConfigItems {
 }
 
 interface IConfigurableActivity<T : Activity> : IHasConfigItems
+
+fun normalizeSuggestedServerUrl(value: String): String = value.trim().trimEnd('/')
+
+fun appendSuggestedServerUrl(urls: List<String>, raw: String): List<String> {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return urls
+    val normalized = normalizeSuggestedServerUrl(trimmed)
+    if (urls.any { normalizeSuggestedServerUrl(it) == normalized }) return urls
+    return urls + trimmed
+}
 
 
 fun <T> T.getConfigContent(): String where T : Activity {
@@ -66,6 +77,15 @@ fun <T> T.loadConfig() where T : Activity, T : IHasConfigItems {
     } catch (e: SerializationException) {
         Toast.makeText(this, "Configuration file error: $e", Toast.LENGTH_SHORT).show()
         IdolyprideConfig()
+    }
+
+    if (config.privateServerUrl.isNotBlank()) {
+        val migratedUrl = config.privateServerUrl.trim()
+        config.suggestedServerUrls = appendSuggestedServerUrl(config.suggestedServerUrls, migratedUrl)
+        config.privateServerEnabled = false
+        config.privateServerUrl = ""
+        config.privateServerCaPem = ""
+        Log.i(TAG, "PrivateServerPage: migrated $migratedUrl into suggested servers")
     }
     saveConfig()
 

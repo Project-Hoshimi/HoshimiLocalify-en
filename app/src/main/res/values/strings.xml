@@ -26,7 +26,7 @@
     <string name="useMasterDBTrans">Enable MasterDB Localization</string>
     <string name="export_text">Export Text</string>
     <string name="force_export_resource">Force Export Resource</string>
-    <string name="private_server">Private Server</string>
+    <string name="private_server">Servers</string>
     <string name="private_server_enabled">Enable private server</string>
     <string name="private_server_url">Server URL</string>
     <string name="private_server_url_hint">https://sumire.lan:8443</string>

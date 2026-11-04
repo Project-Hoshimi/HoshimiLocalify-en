@@ -105,6 +105,15 @@ One build covers the official server and any number of private sumire-sr servers
 pick the server inside the game. The module app is not required: this works in standalone mode
 (LSPatch-embedded module, app not installed).
 
+**Servers page (module app).** The module app's *Servers* page is only an add-server shortcut:
+URLs entered there are saved as `suggestedServerUrls` in `ipr-config.json`, forwarded by
+`initIprConfig` to `<game dataDir>/files/hoshimi-profiles/suggested.json` (main process only), and
+listed in the picker as `<url> (from app)` unless a profile with the same normalized URL already
+exists. Choosing one runs the normal add-server flow (CA bootstrap, fingerprint confirmation,
+switch warning); the page never enables a private server and never changes the active one. On the
+first app start after upgrading, an old `privateServerUrl` is moved into the suggested list and
+the legacy `privateServerEnabled` / `privateServerUrl` / `privateServerCaPem` fields are cleared.
+
 - **Switch server button.** `ServerSwitchOverlay.kt` adds a small native `Button` to the game
   activity's content view. Native hooks on `Solis.Title.TitlePresenter` (`Start`,
   `MoveOutGameAsync`, `OnDestroy` in `Hook.cpp`) report title-screen visibility through
@@ -146,6 +155,7 @@ Files under `<game dataDir>/files/hoshimi-profiles/` (managed by `ServerProfileS
 |---|---|
 | `profiles.json` | `{id, kind: "official"\|"private", url, caPem, caSha256, label}`; `official` always exists |
 | `active.json` | `{activeId}` |
+| `suggested.json` | JSON array of app-suggested server URLs; picker shows them as "from app" until added |
 | `clear-pending` | target profile id, written before a switch and consumed on the next start |
 | `pending.json` | legacy swap journal `{targetId, fromId, phase, attempts}`; only read now |
 | `<profileId>/account/` | legacy per-server stash, no longer written |

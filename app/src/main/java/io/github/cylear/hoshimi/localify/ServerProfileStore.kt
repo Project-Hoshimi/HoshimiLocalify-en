@@ -9,6 +9,7 @@ import android.util.Log
 import io.github.cylear.hoshimi.localify.models.IdolyprideConfig
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
@@ -79,6 +80,7 @@ object ServerProfileStore {
     private const val FILE_PROFILES = "profiles.json"
     private const val FILE_ACTIVE = "active.json"
     private const val FILE_PENDING = "pending.json"
+    private const val FILE_SUGGESTED = "suggested.json"
 
     /**
      * Marker written right before a switch relaunch. Native runs the game's own Delete Data
@@ -120,6 +122,7 @@ object ServerProfileStore {
         prettyPrint = true
     }
     private val profileListSerializer = ListSerializer(ServerProfile.serializer())
+    private val suggestedServerListSerializer = ListSerializer(String.serializer())
 
     /** Synchronises this object's file access; every entry point may run on any thread. */
     private val lock = Any()
@@ -186,6 +189,34 @@ object ServerProfileStore {
     fun profilesDir(filesDir: File): File = File(filesDir, PROFILE_DIR_NAME)
 
     fun profilesDirForDataDir(dataDir: File): File = profilesDir(File(dataDir, "files"))
+
+    // ---- suggested servers (companion app) ----------------------------------------------
+
+    /** Replaces `suggested.json` with [urls] as received. */
+    fun updateSuggestedServers(filesDir: File, urls: List<String>) {
+        synchronized(lock) {
+            try {
+                writeAtomically(
+                    File(profilesDir(filesDir), FILE_SUGGESTED),
+                    json.encodeToString(suggestedServerListSerializer, urls)
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "ServerProfileStore: cannot update suggested servers", t)
+            }
+        }
+    }
+
+    /** Reads `suggested.json`; a missing or malformed file yields an empty list. */
+    fun readSuggestedServers(filesDir: File): List<String> = synchronized(lock) {
+        val file = File(profilesDir(filesDir), FILE_SUGGESTED)
+        try {
+            if (!file.isFile) emptyList()
+            else json.decodeFromString(suggestedServerListSerializer, file.readText())
+        } catch (t: Throwable) {
+            Log.w(TAG, "ServerProfileStore: cannot read ${file.absolutePath}", t)
+            emptyList()
+        }
+    }
 
     fun accountDir(filesDir: File, profileId: String): File =
         File(File(profilesDir(filesDir), profileId), ACCOUNT_DIR_NAME)
