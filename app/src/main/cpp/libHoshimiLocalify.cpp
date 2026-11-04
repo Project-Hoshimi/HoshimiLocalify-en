@@ -72,7 +72,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 extern "C"
 JNIEXPORT jobjectArray JNICALL
-Java_io_github_cylear_hoshimi_localify_NotificationLocalizer_translateTexts(
+Java_io_github_tokanada_hoshimi_localify_NotificationLocalizer_translateTexts(
         JNIEnv* env, jclass clazz, jstring basePath, jstring userName, jobjectArray texts) {
     if (!basePath || !texts) return texts;
     try {
@@ -121,7 +121,7 @@ Java_io_github_cylear_hoshimi_localify_NotificationLocalizer_translateTexts(
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_initHook(JNIEnv *env, jclass clazz, jstring targetLibraryPath,
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_initHook(JNIEnv *env, jclass clazz, jstring targetLibraryPath,
                                                                  jstring localizationFilesDir) {
     g_hoshimiHookMainClass = clazz;
     showToastMethodId = env->GetStaticMethodID(clazz, "showToast", "(Ljava/lang/String;)V");
@@ -142,7 +142,7 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_initHook(JNIEnv *env, jcl
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_keyboardEvent(JNIEnv *env, jclass clazz, jint key_code, jint action) {
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_keyboardEvent(JNIEnv *env, jclass clazz, jint key_code, jint action) {
     IPCamera::on_cam_rawinput_keyboard(action, key_code);
     const auto msg = HoshimiLocal::Local::OnKeyDown(action, key_code);
     if (!msg.empty()) {
@@ -160,7 +160,7 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_keyboardEvent(JNIEnv *env
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_joystickEvent(JNIEnv *env, jclass clazz,
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_joystickEvent(JNIEnv *env, jclass clazz,
                                                                       jint action,
                                                                       jfloat leftStickX,
                                                                       jfloat leftStickY,
@@ -176,7 +176,7 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_joystickEvent(JNIEnv *env
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, jclass clazz,
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, jclass clazz,
                                                                    jstring config_json_str) {
     const auto configJsonStrChars = env->GetStringUTFChars(config_json_str, nullptr);
     if (!configJsonStrChars) return;
@@ -187,7 +187,7 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_loadConfig(JNIEnv *env, j
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_requestClearUserData(JNIEnv *env,
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_requestClearUserData(JNIEnv *env,
                                                                              jclass clazz) {
     g_clearUserDataRequested.store(true);
     HoshimiLocal::Log::Info("ServerSwitch: clear user data requested");
@@ -195,14 +195,14 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_requestClearUserData(JNIE
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_getGameAuthToken(JNIEnv *env, jclass clazz) {
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_getGameAuthToken(JNIEnv *env, jclass clazz) {
     const std::string token = HoshimiLocal::PrivateServer::GetAuthToken();
     return env->NewStringUTF(token.c_str());
 }
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIEnv *env,
+Java_io_github_tokanada_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIEnv *env,
                                                                              jclass clazz) {
     // HoshimiLocal::Log::ToastLoop(env, clazz);
     HoshimiLocal::Log::ScreenRootLoop(env, clazz);
@@ -218,7 +218,7 @@ Java_io_github_cylear_hoshimi_localify_HoshimiHookMain_pluginCallbackLooper(JNIE
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_io_github_cylear_hoshimi_localify_models_NativeInitProgress_pluginInitProgressLooper(
+Java_io_github_tokanada_hoshimi_localify_models_NativeInitProgress_pluginInitProgressLooper(
         JNIEnv *env, jclass clazz, jobject progress) {
 
     // jclass progressClass = env->GetObjectClass(progress);

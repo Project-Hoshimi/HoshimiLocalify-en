@@ -42,9 +42,9 @@ All new logic lives in **new files**:
 
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.hpp`
 - `app/src/main/cpp/HoshimiLocalify/PrivateServer.cpp`
-- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerTrust.kt`
-- `app/src/main/java/io/github/cylear/hoshimi/localify/PrivateServerRedirect.kt`
-- `app/src/main/java/io/github/cylear/hoshimi/localify/ui/pages/subPages/PrivateServerPage.kt`
+- `app/src/main/java/io/github/tokanada/hoshimi/localify/PrivateServerTrust.kt`
+- `app/src/main/java/io/github/tokanada/hoshimi/localify/PrivateServerRedirect.kt`
+- `app/src/main/java/io/github/tokanada/hoshimi/localify/ui/pages/subPages/PrivateServerPage.kt`
 
 Edits to upstream files stay small and additive:
 
