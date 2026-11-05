@@ -4143,6 +4143,9 @@ namespace HoshimiLocal::HookMain {
             const auto field = klass ? klass->Get<UnityResolve::Field>(fieldName) : nullptr;
             if (!field) {
                 Log::ErrorFmt("LoveRefresh: field %s not found", key.c_str());
+                // A miss may be transient (class not initialized yet), so retry on
+                // the next lookup instead of poisoning the cache with nullptr.
+                return nullptr;
             }
 
             std::lock_guard<std::mutex> lock(fieldMutex);
@@ -4172,9 +4175,105 @@ namespace HoshimiLocal::HookMain {
         std::vector<PendingUnlock> pendingUnlocks;
         constexpr std::size_t kMaxPendingUnlocks = 64;
 
-        void* loveWindowPresenter = nullptr;
+        // The presenter is a managed object. A raw pointer would let the GC move or
+        // collect it and would dangle once the window closes, so root it through an
+        // il2cpp GC handle (0 means "none"). Resolve the exports by name like the
+        // plugin's other il2cpp interop.
+        std::mutex presenterMutex;
+        std::uint32_t loveWindowPresenterHandle = 0;
+
         std::atomic<bool> loveTopRefreshPending{false};
         std::atomic<int> loveTopRefreshCount{0};
+
+        // Real LoveId of the achievement dialog currently being populated. Its
+        // ChangeColor(loveId) runs immediately before SetAchievementStatusListItemModels,
+        // so this scopes pending unlocks to that love instead of matching every love.
+        std::mutex achievementDialogMutex;
+        std::string achievementDialogLoveId;
+
+        void SetAchievementDialogLoveId(void* loveIdString) {
+            const auto loveId = loveIdString
+                    ? static_cast<Il2cppString*>(loveIdString)->ToString() : std::string{};
+            std::lock_guard<std::mutex> lock(achievementDialogMutex);
+            achievementDialogLoveId = loveId;
+        }
+
+        std::string GetAchievementDialogLoveId() {
+            std::lock_guard<std::mutex> lock(achievementDialogMutex);
+            return achievementDialogLoveId;
+        }
+
+        void ReleasePresenterHandle(std::uint32_t handle) {
+            if (handle) UnityResolve::Invoke<void>("il2cpp_gchandle_free", handle);
+        }
+
+        void CaptureLoveWindowPresenter(void* self) {
+            if (!self) return;
+
+            std::uint32_t staleHandle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                if (loveWindowPresenterHandle &&
+                    UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle) == self) {
+                    return;
+                }
+                staleHandle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = 0;
+            }
+            ReleasePresenterHandle(staleHandle);
+
+            const auto handle = UnityResolve::Invoke<std::uint32_t>("il2cpp_gchandle_new", self, true);
+            if (!handle) {
+                Log::Error("LoveRefresh: il2cpp_gchandle_new failed; LoveWindowPresenter not rooted");
+                return;
+            }
+
+            std::uint32_t replacedHandle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                replacedHandle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = handle;
+            }
+            ReleasePresenterHandle(replacedHandle);
+        }
+
+        void* GetLoveWindowPresenter() {
+            std::lock_guard<std::mutex> lock(presenterMutex);
+            return loveWindowPresenterHandle
+                    ? UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle)
+                    : nullptr;
+        }
+
+        void ClearLoveWindowPresenter() {
+            std::uint32_t handle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                handle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = 0;
+            }
+            if (handle) {
+                ReleasePresenterHandle(handle);
+                Log::Info("LoveRefresh: cleared cached LoveWindowPresenter");
+            }
+        }
+
+        void ClearLoveWindowPresenterIfMatches(void* self) {
+            if (!self) return;
+
+            std::uint32_t handle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                if (loveWindowPresenterHandle &&
+                    UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle) == self) {
+                    handle = loveWindowPresenterHandle;
+                    loveWindowPresenterHandle = 0;
+                }
+            }
+            if (handle) {
+                ReleasePresenterHandle(handle);
+                Log::Info("LoveRefresh: cleared cached LoveWindowPresenter on close");
+            }
+        }
 
         void AddPendingUnlock(const std::string& loveId, const std::string& endId, const std::string& endName) {
             if (endId.empty() && endName.empty()) return;
@@ -4278,13 +4377,17 @@ namespace HoshimiLocal::HookMain {
             const auto pendingSnapshot = SnapshotPendingUnlocks();
             if (pendingSnapshot.empty()) return;
 
+            // The dialog's ChangeColor(loveId) ran right before this call; use that
+            // love so one love's unlocks cannot mark another love's endings.
+            const auto loveId = GetAchievementDialogLoveId();
+
             Il2cppUtils::Tools::CSListEditor<void*> editor(storyEndInfos);
             const int count = editor.get_Count();
             if (count <= 0 || count > 1000) return;
 
             int marked = 0;
             for (int i = 0; i < count; ++i) {
-                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), {}, pendingSnapshot)) {
+                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), loveId, pendingSnapshot)) {
                     ++marked;
                 }
             }
@@ -4294,8 +4397,10 @@ namespace HoshimiLocal::HookMain {
             }
         }
 
-        // Returns true when finishResponse belongs to an ending finish.
-        bool RecordEndingUnlocks(void* finishResponse) {
+        // Returns true when the hook queued at least one unlock for a finish that
+        // the original EvaluateEndAsync classified as an ending.
+        bool RecordEndingUnlocks(void* finishResponse, bool isEnding) {
+            if (!isEnding) return false;
             if (!finishResponse || !IsInstanceOf(finishResponse, "LoveFinishResponse")) return false;
 
             const auto storyEndNameField = FindField("Solis.Common.Proto.Api", "LoveFinishResponse", "storyEndName_");
@@ -4306,7 +4411,6 @@ namespace HoshimiLocal::HookMain {
             const auto unlockedIdsField = FindField("Solis.Common.Proto.Transaction", "UserLove", "unlockedLoveStoryEndIDs_");
 
             const auto endName = ReadStringField(finishResponse, storyEndNameField);
-            if (endName.empty()) return false;
 
             bool recordedIds = false;
             const auto commonResponse = commonResponseField
@@ -4341,8 +4445,13 @@ namespace HoshimiLocal::HookMain {
             }
 
             // LoveFinishResponse has no LoveId, so fall back to the ending name only
-            // when the response did not carry any UnlockedLoveStoryEndIDs.
+            // when the response did not carry any UnlockedLoveStoryEndIDs. If the
+            // ending finish carried neither, there is nothing to record.
             if (!recordedIds) {
+                if (endName.empty()) {
+                    Log::Info("LoveRefresh: ending finish carried no StoryEndName or unlock ids");
+                    return false;
+                }
                 AddPendingUnlock({}, {}, endName);
             }
 
@@ -4357,14 +4466,14 @@ namespace HoshimiLocal::HookMain {
         void RequestLoveTopRefresh() {
             if (!Config::privateServerEnabled) return;
 
-            const auto presenter = loveWindowPresenter;
+            const auto presenter = GetLoveWindowPresenter();
             if (!presenter) {
                 Log::Error("LoveRefresh: LoveWindowPresenter not captured, skipping Love:Top refresh");
                 return;
             }
             if (!IsInstanceOf(presenter, "LoveWindowPresenter")) {
                 Log::Error("LoveRefresh: stale LoveWindowPresenter, skipping Love:Top refresh");
-                loveWindowPresenter = nullptr;
+                ClearLoveWindowPresenter();
                 return;
             }
 
@@ -4381,7 +4490,20 @@ namespace HoshimiLocal::HookMain {
             // il2cpp instance methods take a trailing MethodInfo*. Passing null is
             // safe here (the async starter does not need it) and keeps the raw
             // function-pointer call ABI-correct.
-            requestMethod->Invoke<SolisUniTask>(presenter, cancellationToken, static_cast<void*>(nullptr));
+            SolisUniTask request{};
+            try {
+                request = requestMethod->Invoke<SolisUniTask>(
+                        presenter, cancellationToken, static_cast<void*>(nullptr));
+            } catch (...) {
+                request = {};
+            }
+            // A failed/throwing invoke leaves a default task (null source). Do not
+            // leave the pending flag armed, or the next unrelated Top would consume it.
+            if (!request.source) {
+                loveTopRefreshPending.store(false);
+                Log::Error("LoveRefresh: Love:Top refresh request failed; pending flag reset");
+                return;
+            }
             Log::InfoFmt("LoveRefresh: requested Love:Top refresh after ending (#%d)",
                          loveTopRefreshCount.fetch_add(1) + 1);
         }
@@ -4389,20 +4511,30 @@ namespace HoshimiLocal::HookMain {
 
     DEFINE_HOOK(void*, LoveWindowPresenter_get_Model, (void* self, void* mtd)) {
         const auto ret = LoveWindowPresenter_get_Model_Orig(self, mtd);
-        if (self) LoveRefresh::loveWindowPresenter = self;
+        LoveRefresh::CaptureLoveWindowPresenter(self);
         return ret;
     }
 
     DEFINE_HOOK(void*, LoveWindowPresenter_GetLoveTopResponse, (void* self, void* mtd)) {
         const auto ret = LoveWindowPresenter_GetLoveTopResponse_Orig(self, mtd);
-        if (self) LoveRefresh::loveWindowPresenter = self;
+        LoveRefresh::CaptureLoveWindowPresenter(self);
         return ret;
     }
 
     DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_InitializeAsync,
                 (void* self, void* param, SolisCancellationToken cancellationToken, void* mtd)) {
-        if (self) LoveRefresh::loveWindowPresenter = self;
+        LoveRefresh::CaptureLoveWindowPresenter(self);
         return LoveWindowPresenter_InitializeAsync_Orig(self, param, cancellationToken, mtd);
+    }
+
+    // Close path for the window that was cached above. The async state machine
+    // (<OnCloseOutAsync>d__34) keeps the presenter alive, so clearing the rooted
+    // pointer right after the original starts is safe.
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_OnCloseOutAsync,
+                (void* self, void* info, SolisCancellationToken cancellationToken, void* mtd)) {
+        const auto ret = LoveWindowPresenter_OnCloseOutAsync_Orig(self, info, cancellationToken, mtd);
+        LoveRefresh::ClearLoveWindowPresenterIfMatches(self);
+        return ret;
     }
 
     DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
@@ -4427,7 +4559,7 @@ namespace HoshimiLocal::HookMain {
         const auto isEnding = LoveAdvPlayerScreenPresenter_EvaluateEndAsync_Orig(self, finishResponse, mtd);
         if (!Config::privateServerEnabled) return isEnding;
 
-        if (LoveRefresh::RecordEndingUnlocks(finishResponse)) {
+        if (LoveRefresh::RecordEndingUnlocks(finishResponse, isEnding)) {
             LoveRefresh::RequestLoveTopRefresh();
         }
         return isEnding;
@@ -4455,6 +4587,17 @@ namespace HoshimiLocal::HookMain {
             LoveRefresh::ApplyPendingUnlocksToLoveInfo(loveInfo);
         }
         LoveCharacterSelectSnapListCellView_SetAchievementView_Orig(self, loveInfo, mtd);
+    }
+
+    // The dialog's b__0 calls ChangeColor(loveInfo.LoveId) immediately before
+    // SetAchievementStatusListItemModels(loveInfo.StoryEndInfos); remember the
+    // real id so the apply pass is scoped to that love.
+    DEFINE_HOOK(void, LoveAchievementStatusDialogPresenter_ChangeColor,
+                (void* self, void* loveId, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::SetAchievementDialogLoveId(loveId);
+        }
+        LoveAchievementStatusDialogPresenter_ChangeColor_Orig(self, loveId, mtd);
     }
 
     DEFINE_HOOK(void, LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
@@ -6866,6 +7009,9 @@ namespace HoshimiLocal::HookMain {
             ADD_HOOK(LoveWindowPresenter_InitializeAsync, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "InitializeAsync",
                     {"*", "*"}));
+            ADD_HOOK(LoveWindowPresenter_OnCloseOutAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "OnCloseOutAsync",
+                    {"*", "*"}));
             ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
             ADD_HOOK(LoveAdvPlayerScreenPresenter_EvaluateEndAsync, Il2cppUtils::GetMethodPointer(
@@ -6879,6 +7025,9 @@ namespace HoshimiLocal::HookMain {
             ADD_HOOK(LoveCharacterSelectSnapListCellView_SetAchievementView, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveCharacterSelectSnapListCellView",
                     "SetAchievementView", {"*"}));
+            ADD_HOOK(LoveAchievementStatusDialogPresenter_ChangeColor, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame",
+                    "LoveAchievementStatusDialogPresenter", "ChangeColor", {"*"}));
             ADD_HOOK(LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
                      Il2cppUtils::GetMethodPointer(
                              "Assembly-CSharp.dll", "Solis.OutGame",
