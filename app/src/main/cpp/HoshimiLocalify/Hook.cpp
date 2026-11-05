@@ -19,6 +19,7 @@
 #include "config/Config.hpp"
 // #include <jni.h>
 #include <thread>
+#include <mutex>
 #include <map>
 #include <set>
 #include <sstream>
@@ -4113,6 +4114,358 @@ namespace HoshimiLocal::HookMain {
         return false;
     }
 
+    // ---------------------------------------------------------------------------
+    // Love (MoshiKoi) refresh
+    //
+    // The private server resets the Love route to its first episode and records a
+    // cleared ending when Love:Finish reaches an ending. The client only refetches
+    // Love:Top after a non-ending finish, so the episode list keeps the old route.
+    // The title/character-select screens also keep a cached List<LoveInfo> whose
+    // StoryEndInfo.Unlocked flags are never refreshed. These hooks reuse the
+    // client's own Love:Top request after an ending and mark the matching cached
+    // ending entries as unlocked.
+    // ---------------------------------------------------------------------------
+    namespace LoveRefresh {
+        using Il2cppString = UnityResolve::UnityType::String;
+
+        std::mutex fieldMutex;
+        std::unordered_map<std::string, UnityResolve::Field*> fieldCache;
+
+        UnityResolve::Field* FindField(const char* nameSpace, const char* className, const char* fieldName) {
+            const std::string key = std::string(nameSpace) + "::" + className + "." + fieldName;
+            {
+                std::lock_guard<std::mutex> lock(fieldMutex);
+                const auto it = fieldCache.find(key);
+                if (it != fieldCache.end()) return it->second;
+            }
+
+            const auto klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", nameSpace, className);
+            const auto field = klass ? klass->Get<UnityResolve::Field>(fieldName) : nullptr;
+            if (!field) {
+                Log::ErrorFmt("LoveRefresh: field %s not found", key.c_str());
+            }
+
+            std::lock_guard<std::mutex> lock(fieldMutex);
+            fieldCache.emplace(key, field);
+            return field;
+        }
+
+        bool IsInstanceOf(void* obj, const char* className) {
+            if (!obj || !className) return false;
+            const auto klass = Il2cppUtils::get_class_from_instance(obj);
+            return klass && klass->name && std::string(klass->name) == className;
+        }
+
+        std::string ReadStringField(void* obj, UnityResolve::Field* field) {
+            if (!obj || !field) return {};
+            const auto value = Il2cppUtils::ClassGetFieldValue<Il2cppString*>(obj, field);
+            return value ? value->ToString() : std::string{};
+        }
+
+        struct PendingUnlock {
+            std::string loveId;
+            std::string endId;
+            std::string endName;
+        };
+
+        std::mutex pendingMutex;
+        std::vector<PendingUnlock> pendingUnlocks;
+        constexpr std::size_t kMaxPendingUnlocks = 64;
+
+        void* loveWindowPresenter = nullptr;
+        std::atomic<bool> loveTopRefreshPending{false};
+        std::atomic<int> loveTopRefreshCount{0};
+
+        void AddPendingUnlock(const std::string& loveId, const std::string& endId, const std::string& endName) {
+            if (endId.empty() && endName.empty()) return;
+
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            for (const auto& pending : pendingUnlocks) {
+                if (pending.loveId == loveId && pending.endId == endId && pending.endName == endName) return;
+            }
+            if (pendingUnlocks.size() >= kMaxPendingUnlocks) {
+                pendingUnlocks.erase(pendingUnlocks.begin());
+            }
+            pendingUnlocks.push_back({loveId, endId, endName});
+        }
+
+        bool MatchesPending(const PendingUnlock& pending, const std::string& loveId,
+                            const std::string& endId, const std::string& endName) {
+            // An empty actual LoveId means the caller only knows the ending entry
+            // (e.g. the details dialog list), so match on the ending id alone.
+            if (!pending.loveId.empty() && !loveId.empty() && pending.loveId != loveId) return false;
+            if (!pending.endId.empty()) return pending.endId == endId;
+            return !pending.endName.empty() && pending.endName == endName;
+        }
+
+        bool ApplyPendingToStoryEndInfo(void* endInfo, const std::string& loveId,
+                                        const std::vector<PendingUnlock>& pendingSnapshot) {
+            if (!endInfo || !IsInstanceOf(endInfo, "LoveStoryEndInfo")) return false;
+
+            const auto endIdField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "id_");
+            const auto endNameField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "name_");
+            const auto unlockedField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "unlocked_");
+            if (!endIdField || !endNameField || !unlockedField) return false;
+
+            const auto endId = ReadStringField(endInfo, endIdField);
+            const auto endName = ReadStringField(endInfo, endNameField);
+            bool matched = false;
+            for (const auto& pending : pendingSnapshot) {
+                if (MatchesPending(pending, loveId, endId, endName)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
+
+            if (Il2cppUtils::ClassGetFieldValue<bool>(endInfo, unlockedField)) return false;
+            Il2cppUtils::ClassSetFieldValue(endInfo, unlockedField, true);
+            return true;
+        }
+
+        std::vector<PendingUnlock> SnapshotPendingUnlocks() {
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            return pendingUnlocks;
+        }
+
+        void ApplyPendingUnlocksToLoveInfo(void* loveInfo) {
+            if (!loveInfo || !IsInstanceOf(loveInfo, "LoveInfo")) return;
+
+            const auto pendingSnapshot = SnapshotPendingUnlocks();
+            if (pendingSnapshot.empty()) return;
+
+            const auto storyEndInfosField = FindField("Solis.Common.Proto.Api", "LoveInfo", "storyEndInfos_");
+            const auto loveIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "loveId_");
+            if (!storyEndInfosField || !loveIdField) return;
+
+            const auto loveId = ReadStringField(loveInfo, loveIdField);
+            const auto storyEndInfos = Il2cppUtils::ClassGetFieldValue<void*>(loveInfo, storyEndInfosField);
+            if (!storyEndInfos) return;
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(storyEndInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            int marked = 0;
+            for (int i = 0; i < count; ++i) {
+                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), loveId, pendingSnapshot)) {
+                    ++marked;
+                }
+            }
+
+            if (marked > 0) {
+                Log::InfoFmt("LoveRefresh: marked %d ending(s) unlocked in cached LoveInfo", marked);
+            }
+        }
+
+        void ApplyPendingUnlocksToList(void* loveInfos) {
+            if (!loveInfos || !IsInstanceOf(loveInfos, "List`1")) return;
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(loveInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+            for (int i = 0; i < count; ++i) {
+                ApplyPendingUnlocksToLoveInfo(editor.get_Item(i));
+            }
+        }
+
+        // The achievement dialog receives the story end list right before it
+        // builds its cells; this is the reliable point to reflect a fresh clear
+        // even when the surrounding screen kept its old cell views.
+        void ApplyPendingUnlocksToStoryEndInfoList(void* storyEndInfos) {
+            if (!storyEndInfos) return;
+
+            const auto pendingSnapshot = SnapshotPendingUnlocks();
+            if (pendingSnapshot.empty()) return;
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(storyEndInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            int marked = 0;
+            for (int i = 0; i < count; ++i) {
+                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), {}, pendingSnapshot)) {
+                    ++marked;
+                }
+            }
+
+            if (marked > 0) {
+                Log::InfoFmt("LoveRefresh: marked %d ending(s) unlocked for achievement dialog", marked);
+            }
+        }
+
+        // Returns true when finishResponse belongs to an ending finish.
+        bool RecordEndingUnlocks(void* finishResponse) {
+            if (!finishResponse || !IsInstanceOf(finishResponse, "LoveFinishResponse")) return false;
+
+            const auto storyEndNameField = FindField("Solis.Common.Proto.Api", "LoveFinishResponse", "storyEndName_");
+            const auto commonResponseField = FindField("Solis.Common.Proto.Api", "LoveFinishResponse", "commonResponse_");
+            const auto updatedDataField = FindField("Solis.Common.Proto.Api", "CommonResponse", "updatedData_");
+            const auto lovesField = FindField("Solis.Common.Proto.Api", "UpdatedData", "loves_");
+            const auto userLoveIdField = FindField("Solis.Common.Proto.Transaction", "UserLove", "loveId_");
+            const auto unlockedIdsField = FindField("Solis.Common.Proto.Transaction", "UserLove", "unlockedLoveStoryEndIDs_");
+
+            const auto endName = ReadStringField(finishResponse, storyEndNameField);
+            if (endName.empty()) return false;
+
+            bool recordedIds = false;
+            const auto commonResponse = commonResponseField
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(finishResponse, commonResponseField) : nullptr;
+            const auto updatedData = (commonResponse && updatedDataField)
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(commonResponse, updatedDataField) : nullptr;
+            const auto loves = (updatedData && lovesField)
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(updatedData, lovesField) : nullptr;
+
+            if (loves && userLoveIdField && unlockedIdsField) {
+                Il2cppUtils::Tools::CSListEditor<void*> loveEditor(loves);
+                const int loveCount = loveEditor.get_Count();
+                for (int i = 0; i < loveCount && i < 1000; ++i) {
+                    const auto userLove = loveEditor.get_Item(i);
+                    if (!userLove) continue;
+
+                    const auto loveId = ReadStringField(userLove, userLoveIdField);
+                    const auto unlockedIds = Il2cppUtils::ClassGetFieldValue<void*>(userLove, unlockedIdsField);
+                    if (!unlockedIds) continue;
+
+                    Il2cppUtils::Tools::CSListEditor<Il2cppString*> idEditor(unlockedIds);
+                    const int idCount = idEditor.get_Count();
+                    for (int j = 0; j < idCount && j < 1000; ++j) {
+                        const auto endId = idEditor.get_Item(j);
+                        if (!endId) continue;
+                        const auto id = endId->ToString();
+                        if (id.empty()) continue;
+                        AddPendingUnlock(loveId, id, {});
+                        recordedIds = true;
+                    }
+                }
+            }
+
+            // LoveFinishResponse has no LoveId, so fall back to the ending name only
+            // when the response did not carry any UnlockedLoveStoryEndIDs.
+            if (!recordedIds) {
+                AddPendingUnlock({}, {}, endName);
+            }
+
+            // The cached list is deliberately not touched here: the title screen
+            // model may already be destroyed by the adv player. Pending entries
+            // are applied on the next live access (get_LoveInfos, character
+            // select transition, achievement dialog, cell bind).
+            Log::InfoFmt("LoveRefresh: ending recorded (fromUnlockedIds=%d)", recordedIds ? 1 : 0);
+            return true;
+        }
+
+        void RequestLoveTopRefresh() {
+            if (!Config::privateServerEnabled) return;
+
+            const auto presenter = loveWindowPresenter;
+            if (!presenter) {
+                Log::Error("LoveRefresh: LoveWindowPresenter not captured, skipping Love:Top refresh");
+                return;
+            }
+            if (!IsInstanceOf(presenter, "LoveWindowPresenter")) {
+                Log::Error("LoveRefresh: stale LoveWindowPresenter, skipping Love:Top refresh");
+                loveWindowPresenter = nullptr;
+                return;
+            }
+
+            static const auto requestMethod = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter",
+                    "RequestLoveTopResponseAsync", {"*"});
+            if (!requestMethod || !requestMethod->function) {
+                Log::Error("LoveRefresh: LoveWindowPresenter.RequestLoveTopResponseAsync not found");
+                return;
+            }
+
+            loveTopRefreshPending.store(true);
+            SolisCancellationToken cancellationToken{};
+            // il2cpp instance methods take a trailing MethodInfo*. Passing null is
+            // safe here (the async starter does not need it) and keeps the raw
+            // function-pointer call ABI-correct.
+            requestMethod->Invoke<SolisUniTask>(presenter, cancellationToken, static_cast<void*>(nullptr));
+            Log::InfoFmt("LoveRefresh: requested Love:Top refresh after ending (#%d)",
+                         loveTopRefreshCount.fetch_add(1) + 1);
+        }
+    }
+
+    DEFINE_HOOK(void*, LoveWindowPresenter_get_Model, (void* self, void* mtd)) {
+        const auto ret = LoveWindowPresenter_get_Model_Orig(self, mtd);
+        if (self) LoveRefresh::loveWindowPresenter = self;
+        return ret;
+    }
+
+    DEFINE_HOOK(void*, LoveWindowPresenter_GetLoveTopResponse, (void* self, void* mtd)) {
+        const auto ret = LoveWindowPresenter_GetLoveTopResponse_Orig(self, mtd);
+        if (self) LoveRefresh::loveWindowPresenter = self;
+        return ret;
+    }
+
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_InitializeAsync,
+                (void* self, void* param, SolisCancellationToken cancellationToken, void* mtd)) {
+        if (self) LoveRefresh::loveWindowPresenter = self;
+        return LoveWindowPresenter_InitializeAsync_Orig(self, param, cancellationToken, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
+        LoveWindowModel_SetLoveTopResponse_Orig(self, response, mtd);
+        if (!Config::privateServerEnabled) return;
+        if (!LoveRefresh::loveTopRefreshPending.exchange(false)) return;
+
+        int episodeCount = 0;
+        const auto episodeIdsField = LoveRefresh::FindField(
+                "Solis.Common.Proto.Api", "LoveTopResponse", "storyEpisodeIds_");
+        const auto episodeIds = (response && episodeIdsField)
+                ? Il2cppUtils::ClassGetFieldValue<void*>(response, episodeIdsField) : nullptr;
+        if (episodeIds) {
+            Il2cppUtils::Tools::CSListEditor<LoveRefresh::Il2cppString*> editor(episodeIds);
+            episodeCount = editor.get_Count();
+        }
+        Log::InfoFmt("LoveRefresh: Love:Top response applied after ending (episodes=%d)", episodeCount);
+    }
+
+    DEFINE_HOOK(bool, LoveAdvPlayerScreenPresenter_EvaluateEndAsync,
+                (void* self, void* finishResponse, void* mtd)) {
+        const auto isEnding = LoveAdvPlayerScreenPresenter_EvaluateEndAsync_Orig(self, finishResponse, mtd);
+        if (!Config::privateServerEnabled) return isEnding;
+
+        if (LoveRefresh::RecordEndingUnlocks(finishResponse)) {
+            LoveRefresh::RequestLoveTopRefresh();
+        }
+        return isEnding;
+    }
+
+    DEFINE_HOOK(void*, LoveTitleScreenModelBase_get_LoveInfos, (void* self, void* mtd)) {
+        const auto loveInfos = LoveTitleScreenModelBase_get_LoveInfos_Orig(self, mtd);
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::ApplyPendingUnlocksToList(loveInfos);
+        }
+        return loveInfos;
+    }
+
+    DEFINE_HOOK(void, LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen,
+                (void* self, void* loveInfos, void* mtd)) {
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::ApplyPendingUnlocksToList(loveInfos);
+        }
+        LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen_Orig(self, loveInfos, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveCharacterSelectSnapListCellView_SetAchievementView,
+                (void* self, void* loveInfo, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::ApplyPendingUnlocksToLoveInfo(loveInfo);
+        }
+        LoveCharacterSelectSnapListCellView_SetAchievementView_Orig(self, loveInfo, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
+                (void* self, void* storyEndInfos, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::ApplyPendingUnlocksToStoryEndInfoList(storyEndInfos);
+        }
+        LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels_Orig(
+                self, storyEndInfos, mtd);
+    }
+
     std::string GetSolisSafePhotoExpressionId(void* characterIds, const std::string& currentExpressionId = "") {
         if (!characterIds) return currentExpressionId;
 
@@ -6502,6 +6855,36 @@ namespace HoshimiLocal::HookMain {
 #endif
 
         PrivateServer::Install(hookInstaller);
+
+        // Love (MoshiKoi) refresh after an ending. Only the private server resets
+        // the route and records the cleared ending, so gate on its toggle.
+        if (Config::privateServerEnabled) {
+            ADD_HOOK(LoveWindowPresenter_get_Model, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "get_Model"));
+            ADD_HOOK(LoveWindowPresenter_GetLoveTopResponse, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetLoveTopResponse"));
+            ADD_HOOK(LoveWindowPresenter_InitializeAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "InitializeAsync",
+                    {"*", "*"}));
+            ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
+            ADD_HOOK(LoveAdvPlayerScreenPresenter_EvaluateEndAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveAdvPlayerScreenPresenter",
+                    "EvaluateEndAsync", {"*"}));
+            ADD_HOOK(LoveTitleScreenModelBase_get_LoveInfos, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenModelBase", "get_LoveInfos"));
+            ADD_HOOK(LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenPresenter",
+                    "MoveLoveCharacterSelectScreen", {"*"}));
+            ADD_HOOK(LoveCharacterSelectSnapListCellView_SetAchievementView, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveCharacterSelectSnapListCellView",
+                    "SetAchievementView", {"*"}));
+            ADD_HOOK(LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
+                     Il2cppUtils::GetMethodPointer(
+                             "Assembly-CSharp.dll", "Solis.OutGame",
+                             "LoveAchievementStatusDialogPresenter",
+                             "SetAchievementStatusListItemModels", {"*"}));
+        }
 
         ADD_HOOK(SolisQualityManager_set_TargetFrameRate,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
