@@ -4181,6 +4181,9 @@ namespace HoshimiLocal::HookMain {
         // plugin's other il2cpp interop.
         std::mutex presenterMutex;
         std::uint32_t loveWindowPresenterHandle = 0;
+        // Extra-love assets already preloaded for the cached presenter (guarded by
+        // presenterMutex; reset whenever the cached presenter changes or clears).
+        std::set<std::string> earlyPreloadedAssets;
 
         std::atomic<bool> loveTopRefreshPending{false};
         std::atomic<int> loveTopRefreshCount{0};
@@ -4219,6 +4222,7 @@ namespace HoshimiLocal::HookMain {
                 }
                 staleHandle = loveWindowPresenterHandle;
                 loveWindowPresenterHandle = 0;
+                earlyPreloadedAssets.clear();
             }
             ReleasePresenterHandle(staleHandle);
 
@@ -4250,6 +4254,7 @@ namespace HoshimiLocal::HookMain {
                 std::lock_guard<std::mutex> lock(presenterMutex);
                 handle = loveWindowPresenterHandle;
                 loveWindowPresenterHandle = 0;
+                earlyPreloadedAssets.clear();
             }
             if (handle) {
                 ReleasePresenterHandle(handle);
@@ -4267,6 +4272,7 @@ namespace HoshimiLocal::HookMain {
                     UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle) == self) {
                     handle = loveWindowPresenterHandle;
                     loveWindowPresenterHandle = 0;
+                    earlyPreloadedAssets.clear();
                 }
             }
             if (handle) {
@@ -4564,6 +4570,45 @@ namespace HoshimiLocal::HookMain {
                          loveId.c_str(), assetId.c_str());
         }
 
+        // A fresh Love window starts with an empty asset keeper, and the extra
+        // love's front loading screen is short, so loading only when the love is
+        // opened makes the logo pop in right before that screen fades. Start the
+        // preload as soon as the Love menu has its list, so the keeper is filled
+        // before the user picks the extra love. Once per window and asset.
+        void PreloadExtraLovesFromList(void* loveInfos, const char* when) {
+            if (!Config::privateServerEnabled) return;
+            if (!loveInfos || !IsInstanceOf(loveInfos, "List`1")) return;
+            Il2cppUtils::Tools::CSListEditor<void*> editor(loveInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            const auto baseTypeField = FindField("Solis.Common.Proto.Api", "LoveInfo", "baseType_");
+            const auto assetIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "assetId_");
+            if (!baseTypeField || !assetIdField) return;
+
+            void* presenter = nullptr;
+            for (int i = 0; i < count; ++i) {
+                const auto loveInfo = editor.get_Item(i);
+                if (!loveInfo || !IsInstanceOf(loveInfo, "LoveInfo")) continue;
+                if (Il2cppUtils::ClassGetFieldValue<int32_t>(loveInfo, baseTypeField) != kLoveBaseTypeExtra) continue;
+                const auto assetId = ReadStringField(loveInfo, assetIdField);
+                if (assetId.empty()) continue;
+                if (!presenter) {
+                    presenter = GetLoveWindowPresenter();
+                    if (!presenter) {
+                        Log::InfoFmt("LoveExtra: no Love window yet, skipping early preload (%s)", when);
+                        return;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(presenterMutex);
+                    if (!earlyPreloadedAssets.insert(assetId).second) continue;
+                }
+                Log::InfoFmt("LoveExtra: early preload of %s (%s)", assetId.c_str(), when);
+                PreloadExtraLoveData(presenter, loveInfo, SolisCancellationToken{});
+            }
+        }
+
         // SetLoveInfoAsync copies the extra textures into the window's front
         // loading screen synchronously, right after the preload above starts. When
         // the window is fresh (e.g. opened from the Home Idol page) the async load
@@ -4759,6 +4804,15 @@ namespace HoshimiLocal::HookMain {
             LoveRefresh::ApplyPendingUnlocksToList(loveInfos);
         }
         return loveInfos;
+    }
+
+    // The Love menu's title screen builds its model from the full LoveInfo list
+    // when it opens, seconds before the user can start a love.
+    DEFINE_HOOK(void, LoveTitleScreenModel_ctor, (void* self, void* loveInfos, void* mtd)) {
+        LoveTitleScreenModel_ctor_Orig(self, loveInfos, mtd);
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::PreloadExtraLovesFromList(loveInfos, "title screen");
+        }
     }
 
     DEFINE_HOOK(void, LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen,
@@ -7219,6 +7273,8 @@ namespace HoshimiLocal::HookMain {
             ADD_HOOK(LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenPresenter",
                     "MoveLoveCharacterSelectScreen", {"*"}));
+            ADD_HOOK(LoveTitleScreenModel_ctor, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenModel", ".ctor", {"*"}));
             ADD_HOOK(LoveCharacterSelectSnapListCellView_SetAchievementView, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveCharacterSelectSnapListCellView",
                     "SetAchievementView", {"*"}));
