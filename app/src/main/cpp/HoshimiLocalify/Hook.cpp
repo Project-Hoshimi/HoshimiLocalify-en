@@ -4563,6 +4563,64 @@ namespace HoshimiLocal::HookMain {
             Log::InfoFmt("LoveExtra: started extra data preload for %s (asset %s)",
                          loveId.c_str(), assetId.c_str());
         }
+
+        // SetLoveInfoAsync copies the extra textures into the window's front
+        // loading screen synchronously, right after the preload above starts. When
+        // the window is fresh (e.g. opened from the Home Idol page) the async load
+        // has not finished yet, so the copy is empty. Re-copy them from the keeper
+        // just before the loading screen is shown, when the load has completed.
+        struct ExtraLoadingTextures {
+            void* logo;
+            void* icon;
+        };
+
+        void RefreshExtraFrontLoading(void* loading) {
+            if (!Config::privateServerEnabled) return;
+            if (!loading || !IsInstanceOf(loading, "LoveFullScreenLoading")) return;
+
+            const auto baseTypeField = FindField("Solis.OutGame", "LoveFullScreenLoading", "_baseType");
+            if (!baseTypeField) return;
+            if (Il2cppUtils::ClassGetFieldValue<int32_t>(loading, baseTypeField) != kLoveBaseTypeExtra) return;
+
+            const auto presenter = GetLoveWindowPresenter();
+            if (!presenter || !IsInstanceOf(presenter, "LoveWindowPresenter")) return;
+
+            static const auto getView = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "get_View");
+            static const auto getLoadingData = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetExtraLoadingData");
+            static const auto getBackground = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetExtraBackgroundTexture");
+            static const auto setExtraData = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveFullScreenLoading", "SetExtraData",
+                    {"*", "*", "*"});
+            if (!getView || !getView->function || !getLoadingData || !getLoadingData->function ||
+                !getBackground || !getBackground->function || !setExtraData || !setExtraData->function) {
+                Log::Error("LoveExtra: front loading refresh methods not found");
+                return;
+            }
+
+            try {
+                // Only touch the loading screen that belongs to the cached window.
+                const auto view = getView->Invoke<void*>(presenter, static_cast<void*>(nullptr));
+                const auto frontLoadingField = FindField("Solis.OutGame", "LoveWindowView", "_frontLoading");
+                if (!view || !frontLoadingField) return;
+                if (Il2cppUtils::ClassGetFieldValue<void*>(view, frontLoadingField) != loading) return;
+
+                const auto textures = getLoadingData->Invoke<ExtraLoadingTextures>(
+                        presenter, static_cast<void*>(nullptr));
+                if (!textures.logo) {
+                    Log::Info("LoveExtra: extra logo still not loaded at StartLoading");
+                    return;
+                }
+                const auto background = getBackground->Invoke<void*>(presenter, static_cast<void*>(nullptr));
+                setExtraData->Invoke<void>(loading, background, textures.logo, textures.icon,
+                                           static_cast<void*>(nullptr));
+                Log::Info("LoveExtra: refreshed extra logo on the front loading screen");
+            } catch (...) {
+                Log::Error("LoveExtra: front loading refresh threw; leaving loading screen as is");
+            }
+        }
     }
 
     DEFINE_HOOK(void*, LoveWindowPresenter_get_Model, (void* self, void* mtd)) {
@@ -4600,6 +4658,11 @@ namespace HoshimiLocal::HookMain {
                 (void* self, void* loveInfo, SolisCancellationToken cancellationToken, void* mtd)) {
         LoveRefresh::PreloadExtraLoveData(self, loveInfo, cancellationToken);
         return LoveWindowPresenter_SetLoveInfoAsync_Orig(self, loveInfo, cancellationToken, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveFullScreenLoading_StartLoading, (void* self, void* mtd)) {
+        LoveRefresh::RefreshExtraFrontLoading(self);
+        LoveFullScreenLoading_StartLoading_Orig(self, mtd);
     }
 
     DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
@@ -7080,6 +7143,8 @@ namespace HoshimiLocal::HookMain {
             ADD_HOOK(LoveWindowPresenter_SetLoveInfoAsync, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "SetLoveInfoAsync",
                     {"*", "*"}));
+            ADD_HOOK(LoveFullScreenLoading_StartLoading, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveFullScreenLoading", "StartLoading"));
             ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
             ADD_HOOK(LoveAdvPlayerScreenPresenter_EvaluateEndAsync, Il2cppUtils::GetMethodPointer(
