@@ -4507,6 +4507,62 @@ namespace HoshimiLocal::HookMain {
             Log::InfoFmt("LoveRefresh: requested Love:Top refresh after ending (#%d)",
                          loveTopRefreshCount.fetch_add(1) + 1);
         }
+
+        // Extra loves (LoveBaseType.Extra = 2, e.g. MoshiKoi "love-extra-25-0426")
+        // read their loading-screen logo/icon/background only from the window's
+        // ReusableAssetKeeper (GetExtraLoadingData / GetExtraBackgroundTexture).
+        // The client fills that cache only in LoadExtraDataAsync, which is called
+        // solely from LoveExtraTitleScreenPresenter (the Home event-banner entry).
+        // The private server lists extras in the normal Love menu instead, so the
+        // standard SetLoveInfoAsync path never loads them and the logo stays blank.
+        // Start the client's own LoadExtraDataAsync (fire-and-forget; it only loads
+        // assets into the keeper) whenever an extra love is set on the window.
+        constexpr int kLoveBaseTypeExtra = 2;
+
+        void PreloadExtraLoveData(void* presenter, void* loveInfo, SolisCancellationToken cancellationToken) {
+            if (!Config::privateServerEnabled) return;
+            if (!presenter || !loveInfo) return;
+            if (!IsInstanceOf(presenter, "LoveWindowPresenter") || !IsInstanceOf(loveInfo, "LoveInfo")) return;
+
+            const auto baseTypeField = FindField("Solis.Common.Proto.Api", "LoveInfo", "baseType_");
+            if (!baseTypeField) return;
+            const auto baseType = Il2cppUtils::ClassGetFieldValue<int32_t>(loveInfo, baseTypeField);
+            if (baseType != kLoveBaseTypeExtra) return;
+
+            const auto assetIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "assetId_");
+            const auto loveIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "loveId_");
+            const auto assetId = ReadStringField(loveInfo, assetIdField);
+            const auto loveId = ReadStringField(loveInfo, loveIdField);
+            if (assetId.empty()) {
+                Log::ErrorFmt("LoveExtra: %s has no AssetId, skipping extra data preload", loveId.c_str());
+                return;
+            }
+
+            static const auto loadMethod = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter",
+                    "LoadExtraDataAsync", {"*", "*"});
+            if (!loadMethod || !loadMethod->function) {
+                Log::Error("LoveExtra: LoveWindowPresenter.LoadExtraDataAsync not found");
+                return;
+            }
+
+            SolisUniTask task{};
+            try {
+                task = loadMethod->Invoke<SolisUniTask>(
+                        presenter, loveInfo, cancellationToken, static_cast<void*>(nullptr));
+            } catch (...) {
+                task = {};
+            }
+            if (!task.source) {
+                // A synchronously completed UniTask also has a null source, so this
+                // is informational rather than a failure.
+                Log::InfoFmt("LoveExtra: LoadExtraDataAsync returned a completed task for %s (asset %s)",
+                             loveId.c_str(), assetId.c_str());
+                return;
+            }
+            Log::InfoFmt("LoveExtra: started extra data preload for %s (asset %s)",
+                         loveId.c_str(), assetId.c_str());
+        }
     }
 
     DEFINE_HOOK(void*, LoveWindowPresenter_get_Model, (void* self, void* mtd)) {
@@ -4535,6 +4591,15 @@ namespace HoshimiLocal::HookMain {
         const auto ret = LoveWindowPresenter_OnCloseOutAsync_Orig(self, info, cancellationToken, mtd);
         LoveRefresh::ClearLoveWindowPresenterIfMatches(self);
         return ret;
+    }
+
+    // Standard Love-menu entry (LoveGameStartScreenPresenterBase.MoveLoveHomeScreenAsync
+    // -> SetLoveInfoAsync). Kick off the extra-love asset preload before the
+    // original runs so the keeper is filled by the time the loading screen reads it.
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_SetLoveInfoAsync,
+                (void* self, void* loveInfo, SolisCancellationToken cancellationToken, void* mtd)) {
+        LoveRefresh::PreloadExtraLoveData(self, loveInfo, cancellationToken);
+        return LoveWindowPresenter_SetLoveInfoAsync_Orig(self, loveInfo, cancellationToken, mtd);
     }
 
     DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
@@ -7011,6 +7076,9 @@ namespace HoshimiLocal::HookMain {
                     {"*", "*"}));
             ADD_HOOK(LoveWindowPresenter_OnCloseOutAsync, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "OnCloseOutAsync",
+                    {"*", "*"}));
+            ADD_HOOK(LoveWindowPresenter_SetLoveInfoAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "SetLoveInfoAsync",
                     {"*", "*"}));
             ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
