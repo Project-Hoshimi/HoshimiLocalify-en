@@ -4574,15 +4574,10 @@ namespace HoshimiLocal::HookMain {
             void* icon;
         };
 
-        void RefreshExtraFrontLoading(void* loading) {
+        // loading == nullptr means "whatever front loading the presenter's view owns"
+        // (used when the preload finishes while the loading screen is up).
+        void RefreshExtraFrontLoading(void* presenter, void* loading, const char* when) {
             if (!Config::privateServerEnabled) return;
-            if (!loading || !IsInstanceOf(loading, "LoveFullScreenLoading")) return;
-
-            const auto baseTypeField = FindField("Solis.OutGame", "LoveFullScreenLoading", "_baseType");
-            if (!baseTypeField) return;
-            if (Il2cppUtils::ClassGetFieldValue<int32_t>(loading, baseTypeField) != kLoveBaseTypeExtra) return;
-
-            const auto presenter = GetLoveWindowPresenter();
             if (!presenter || !IsInstanceOf(presenter, "LoveWindowPresenter")) return;
 
             static const auto getView = Il2cppUtils::GetMethod(
@@ -4605,21 +4600,81 @@ namespace HoshimiLocal::HookMain {
                 const auto view = getView->Invoke<void*>(presenter, static_cast<void*>(nullptr));
                 const auto frontLoadingField = FindField("Solis.OutGame", "LoveWindowView", "_frontLoading");
                 if (!view || !frontLoadingField) return;
-                if (Il2cppUtils::ClassGetFieldValue<void*>(view, frontLoadingField) != loading) return;
+                const auto frontLoading = Il2cppUtils::ClassGetFieldValue<void*>(view, frontLoadingField);
+                if (!frontLoading || !IsInstanceOf(frontLoading, "LoveFullScreenLoading")) return;
+                if (loading && frontLoading != loading) return;
+
+                const auto baseTypeField = FindField("Solis.OutGame", "LoveFullScreenLoading", "_baseType");
+                if (!baseTypeField) return;
+                if (Il2cppUtils::ClassGetFieldValue<int32_t>(frontLoading, baseTypeField) != kLoveBaseTypeExtra) return;
 
                 const auto textures = getLoadingData->Invoke<ExtraLoadingTextures>(
                         presenter, static_cast<void*>(nullptr));
                 if (!textures.logo) {
-                    Log::Info("LoveExtra: extra logo still not loaded at StartLoading");
+                    Log::InfoFmt("LoveExtra: extra logo not loaded yet (%s)", when);
                     return;
                 }
                 const auto background = getBackground->Invoke<void*>(presenter, static_cast<void*>(nullptr));
-                setExtraData->Invoke<void>(loading, background, textures.logo, textures.icon,
+                setExtraData->Invoke<void>(frontLoading, background, textures.logo, textures.icon,
                                            static_cast<void*>(nullptr));
-                Log::Info("LoveExtra: refreshed extra logo on the front loading screen");
+                Log::InfoFmt("LoveExtra: refreshed extra logo on the front loading screen (%s)", when);
             } catch (...) {
                 Log::Error("LoveExtra: front loading refresh threw; leaving loading screen as is");
             }
+        }
+
+        // The front loading screen is shown ~immediately after SetLoveInfoAsync, long
+        // before the preload finishes, so also refresh when LoadExtraDataAsync's state
+        // machine (<LoadExtraDataAsync>d__NN, a struct) completes. Its MoveNext gets the
+        // unboxed struct, so il2cpp field offsets (which include the object header)
+        // are rebased by two pointers.
+        struct LoadExtraStateMachineLayout {
+            int stateOffset = -1;
+            int thisOffset = -1;
+        };
+        LoadExtraStateMachineLayout loadExtraLayout;
+
+        void* ResolveLoadExtraMoveNext() {
+            const auto presenterClass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter");
+            if (!presenterClass || !presenterClass->address) return nullptr;
+            const auto nested = Il2cppUtils::find_nested_class(presenterClass->address, [](void* klass) {
+                const auto name = static_cast<Il2cppUtils::Il2CppClassHead*>(klass)->name;
+                return name && std::string_view(name).starts_with("<LoadExtraDataAsync>d__");
+            });
+            if (!nested) {
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine not found");
+                return nullptr;
+            }
+            const auto stateField = UnityResolve::Invoke<void*>("il2cpp_class_get_field_from_name", nested, "<>1__state");
+            const auto thisField = UnityResolve::Invoke<void*>("il2cpp_class_get_field_from_name", nested, "<>4__this");
+            const bool isValueType = UnityResolve::Invoke<bool>("il2cpp_class_is_valuetype", nested);
+            if (!stateField || !thisField || !isValueType) {
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine layout unexpected");
+                return nullptr;
+            }
+            constexpr int kHeader = static_cast<int>(2 * sizeof(void*));
+            loadExtraLayout.stateOffset = UnityResolve::Invoke<int>("il2cpp_field_get_offset", stateField) - kHeader;
+            loadExtraLayout.thisOffset = UnityResolve::Invoke<int>("il2cpp_field_get_offset", thisField) - kHeader;
+            if (loadExtraLayout.stateOffset < 0 || loadExtraLayout.thisOffset < 0) {
+                loadExtraLayout = {};
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine offsets invalid");
+                return nullptr;
+            }
+            const auto moveNext = Il2cppUtils::il2cpp_class_get_method_pointer_from_name(nested, "MoveNext", 0);
+            return reinterpret_cast<void*>(moveNext);
+        }
+
+        void OnLoadExtraMoveNext(void* stateMachine) {
+            if (!Config::privateServerEnabled || !stateMachine) return;
+            if (loadExtraLayout.stateOffset < 0 || loadExtraLayout.thisOffset < 0) return;
+            const auto base = static_cast<std::byte*>(stateMachine);
+            int32_t state;
+            void* presenter;
+            std::memcpy(&state, base + loadExtraLayout.stateOffset, sizeof(state));
+            std::memcpy(&presenter, base + loadExtraLayout.thisOffset, sizeof(presenter));
+            if (state != -2 || !presenter) return;  // -2: finished (success or fault)
+            if (presenter != GetLoveWindowPresenter()) return;
+            RefreshExtraFrontLoading(presenter, nullptr, "preload finished");
         }
     }
 
@@ -4661,8 +4716,13 @@ namespace HoshimiLocal::HookMain {
     }
 
     DEFINE_HOOK(void, LoveFullScreenLoading_StartLoading, (void* self, void* mtd)) {
-        LoveRefresh::RefreshExtraFrontLoading(self);
+        LoveRefresh::RefreshExtraFrontLoading(LoveRefresh::GetLoveWindowPresenter(), self, "StartLoading");
         LoveFullScreenLoading_StartLoading_Orig(self, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveWindowPresenter_LoadExtraDataAsync_MoveNext, (void* self, void* mtd)) {
+        LoveWindowPresenter_LoadExtraDataAsync_MoveNext_Orig(self, mtd);
+        LoveRefresh::OnLoadExtraMoveNext(self);
     }
 
     DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
@@ -7145,6 +7205,10 @@ namespace HoshimiLocal::HookMain {
                     {"*", "*"}));
             ADD_HOOK(LoveFullScreenLoading_StartLoading, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveFullScreenLoading", "StartLoading"));
+            // ADD_HOOK expands its address argument more than once, so resolve first.
+            if (const auto loadExtraMoveNext = LoveRefresh::ResolveLoadExtraMoveNext()) {
+                ADD_HOOK(LoveWindowPresenter_LoadExtraDataAsync_MoveNext, loadExtraMoveNext);
+            }
             ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
                     "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
             ADD_HOOK(LoveAdvPlayerScreenPresenter_EvaluateEndAsync, Il2cppUtils::GetMethodPointer(
