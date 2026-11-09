@@ -19,6 +19,7 @@
 #include "config/Config.hpp"
 // #include <jni.h>
 #include <thread>
+#include <mutex>
 #include <map>
 #include <set>
 #include <sstream>
@@ -4113,6 +4114,743 @@ namespace HoshimiLocal::HookMain {
         return false;
     }
 
+    // ---------------------------------------------------------------------------
+    // Love (MoshiKoi) refresh
+    //
+    // The private server resets the Love route to its first episode and records a
+    // cleared ending when Love:Finish reaches an ending. The client only refetches
+    // Love:Top after a non-ending finish, so the episode list keeps the old route.
+    // The title/character-select screens also keep a cached List<LoveInfo> whose
+    // StoryEndInfo.Unlocked flags are never refreshed. These hooks reuse the
+    // client's own Love:Top request after an ending and mark the matching cached
+    // ending entries as unlocked.
+    // ---------------------------------------------------------------------------
+    namespace LoveRefresh {
+        using Il2cppString = UnityResolve::UnityType::String;
+
+        std::mutex fieldMutex;
+        std::unordered_map<std::string, UnityResolve::Field*> fieldCache;
+
+        UnityResolve::Field* FindField(const char* nameSpace, const char* className, const char* fieldName) {
+            const std::string key = std::string(nameSpace) + "::" + className + "." + fieldName;
+            {
+                std::lock_guard<std::mutex> lock(fieldMutex);
+                const auto it = fieldCache.find(key);
+                if (it != fieldCache.end()) return it->second;
+            }
+
+            const auto klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", nameSpace, className);
+            const auto field = klass ? klass->Get<UnityResolve::Field>(fieldName) : nullptr;
+            if (!field) {
+                Log::ErrorFmt("LoveRefresh: field %s not found", key.c_str());
+                // A miss may be transient (class not initialized yet), so retry on
+                // the next lookup instead of poisoning the cache with nullptr.
+                return nullptr;
+            }
+
+            std::lock_guard<std::mutex> lock(fieldMutex);
+            fieldCache.emplace(key, field);
+            return field;
+        }
+
+        bool IsInstanceOf(void* obj, const char* className) {
+            if (!obj || !className) return false;
+            const auto klass = Il2cppUtils::get_class_from_instance(obj);
+            return klass && klass->name && std::string(klass->name) == className;
+        }
+
+        std::string ReadStringField(void* obj, UnityResolve::Field* field) {
+            if (!obj || !field) return {};
+            const auto value = Il2cppUtils::ClassGetFieldValue<Il2cppString*>(obj, field);
+            return value ? value->ToString() : std::string{};
+        }
+
+        struct PendingUnlock {
+            std::string loveId;
+            std::string endId;
+            std::string endName;
+        };
+
+        std::mutex pendingMutex;
+        std::vector<PendingUnlock> pendingUnlocks;
+        constexpr std::size_t kMaxPendingUnlocks = 64;
+
+        // The presenter is a managed object. A raw pointer would let the GC move or
+        // collect it and would dangle once the window closes, so root it through an
+        // il2cpp GC handle (0 means "none"). Resolve the exports by name like the
+        // plugin's other il2cpp interop.
+        std::mutex presenterMutex;
+        std::uint32_t loveWindowPresenterHandle = 0;
+        // Extra-love assets already preloaded for the cached presenter (guarded by
+        // presenterMutex; reset whenever the cached presenter changes or clears).
+        std::set<std::string> earlyPreloadedAssets;
+
+        std::atomic<bool> loveTopRefreshPending{false};
+        std::atomic<int> loveTopRefreshCount{0};
+
+        // Real LoveId of the achievement dialog currently being populated. Its
+        // ChangeColor(loveId) runs immediately before SetAchievementStatusListItemModels,
+        // so this scopes pending unlocks to that love instead of matching every love.
+        std::mutex achievementDialogMutex;
+        std::string achievementDialogLoveId;
+
+        void SetAchievementDialogLoveId(void* loveIdString) {
+            const auto loveId = loveIdString
+                    ? static_cast<Il2cppString*>(loveIdString)->ToString() : std::string{};
+            std::lock_guard<std::mutex> lock(achievementDialogMutex);
+            achievementDialogLoveId = loveId;
+        }
+
+        std::string GetAchievementDialogLoveId() {
+            std::lock_guard<std::mutex> lock(achievementDialogMutex);
+            return achievementDialogLoveId;
+        }
+
+        void ReleasePresenterHandle(std::uint32_t handle) {
+            if (handle) UnityResolve::Invoke<void>("il2cpp_gchandle_free", handle);
+        }
+
+        void CaptureLoveWindowPresenter(void* self) {
+            if (!self) return;
+
+            std::uint32_t staleHandle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                if (loveWindowPresenterHandle &&
+                    UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle) == self) {
+                    return;
+                }
+                staleHandle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = 0;
+                earlyPreloadedAssets.clear();
+            }
+            ReleasePresenterHandle(staleHandle);
+
+            const auto handle = UnityResolve::Invoke<std::uint32_t>("il2cpp_gchandle_new", self, true);
+            if (!handle) {
+                Log::Error("LoveRefresh: il2cpp_gchandle_new failed; LoveWindowPresenter not rooted");
+                return;
+            }
+
+            std::uint32_t replacedHandle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                replacedHandle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = handle;
+            }
+            ReleasePresenterHandle(replacedHandle);
+        }
+
+        void* GetLoveWindowPresenter() {
+            std::lock_guard<std::mutex> lock(presenterMutex);
+            return loveWindowPresenterHandle
+                    ? UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle)
+                    : nullptr;
+        }
+
+        void ClearLoveWindowPresenter() {
+            std::uint32_t handle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                handle = loveWindowPresenterHandle;
+                loveWindowPresenterHandle = 0;
+                earlyPreloadedAssets.clear();
+            }
+            if (handle) {
+                ReleasePresenterHandle(handle);
+                Log::Info("LoveRefresh: cleared cached LoveWindowPresenter");
+            }
+        }
+
+        void ClearLoveWindowPresenterIfMatches(void* self) {
+            if (!self) return;
+
+            std::uint32_t handle = 0;
+            {
+                std::lock_guard<std::mutex> lock(presenterMutex);
+                if (loveWindowPresenterHandle &&
+                    UnityResolve::Invoke<void*>("il2cpp_gchandle_get_target", loveWindowPresenterHandle) == self) {
+                    handle = loveWindowPresenterHandle;
+                    loveWindowPresenterHandle = 0;
+                    earlyPreloadedAssets.clear();
+                }
+            }
+            if (handle) {
+                ReleasePresenterHandle(handle);
+                Log::Info("LoveRefresh: cleared cached LoveWindowPresenter on close");
+            }
+        }
+
+        void AddPendingUnlock(const std::string& loveId, const std::string& endId, const std::string& endName) {
+            if (endId.empty() && endName.empty()) return;
+
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            for (const auto& pending : pendingUnlocks) {
+                if (pending.loveId == loveId && pending.endId == endId && pending.endName == endName) return;
+            }
+            if (pendingUnlocks.size() >= kMaxPendingUnlocks) {
+                pendingUnlocks.erase(pendingUnlocks.begin());
+            }
+            pendingUnlocks.push_back({loveId, endId, endName});
+        }
+
+        bool MatchesPending(const PendingUnlock& pending, const std::string& loveId,
+                            const std::string& endId, const std::string& endName) {
+            // An empty actual LoveId means the caller only knows the ending entry
+            // (e.g. the details dialog list), so match on the ending id alone.
+            if (!pending.loveId.empty() && !loveId.empty() && pending.loveId != loveId) return false;
+            if (!pending.endId.empty()) return pending.endId == endId;
+            return !pending.endName.empty() && pending.endName == endName;
+        }
+
+        bool ApplyPendingToStoryEndInfo(void* endInfo, const std::string& loveId,
+                                        const std::vector<PendingUnlock>& pendingSnapshot) {
+            if (!endInfo || !IsInstanceOf(endInfo, "LoveStoryEndInfo")) return false;
+
+            const auto endIdField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "id_");
+            const auto endNameField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "name_");
+            const auto unlockedField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "unlocked_");
+            if (!endIdField || !endNameField || !unlockedField) return false;
+
+            const auto endId = ReadStringField(endInfo, endIdField);
+            const auto endName = ReadStringField(endInfo, endNameField);
+            bool matched = false;
+            for (const auto& pending : pendingSnapshot) {
+                if (MatchesPending(pending, loveId, endId, endName)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
+
+            if (Il2cppUtils::ClassGetFieldValue<bool>(endInfo, unlockedField)) return false;
+            Il2cppUtils::ClassSetFieldValue(endInfo, unlockedField, true);
+            return true;
+        }
+
+        std::vector<PendingUnlock> SnapshotPendingUnlocks() {
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            return pendingUnlocks;
+        }
+
+        void ApplyPendingUnlocksToLoveInfo(void* loveInfo) {
+            if (!loveInfo || !IsInstanceOf(loveInfo, "LoveInfo")) return;
+
+            const auto pendingSnapshot = SnapshotPendingUnlocks();
+            if (pendingSnapshot.empty()) return;
+
+            const auto storyEndInfosField = FindField("Solis.Common.Proto.Api", "LoveInfo", "storyEndInfos_");
+            const auto loveIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "loveId_");
+            if (!storyEndInfosField || !loveIdField) return;
+
+            const auto loveId = ReadStringField(loveInfo, loveIdField);
+            const auto storyEndInfos = Il2cppUtils::ClassGetFieldValue<void*>(loveInfo, storyEndInfosField);
+            if (!storyEndInfos) return;
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(storyEndInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            int marked = 0;
+            for (int i = 0; i < count; ++i) {
+                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), loveId, pendingSnapshot)) {
+                    ++marked;
+                }
+            }
+
+            if (marked > 0) {
+                Log::InfoFmt("LoveRefresh: marked %d ending(s) unlocked in cached LoveInfo", marked);
+            }
+        }
+
+        void ApplyPendingUnlocksToList(void* loveInfos) {
+            if (!loveInfos || !IsInstanceOf(loveInfos, "List`1")) return;
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(loveInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+            for (int i = 0; i < count; ++i) {
+                ApplyPendingUnlocksToLoveInfo(editor.get_Item(i));
+            }
+        }
+
+        // The achievement dialog receives the story end list right before it
+        // builds its cells; this is the reliable point to reflect a fresh clear
+        // even when the surrounding screen kept its old cell views.
+        void ApplyPendingUnlocksToStoryEndInfoList(void* storyEndInfos) {
+            if (!storyEndInfos) return;
+
+            const auto pendingSnapshot = SnapshotPendingUnlocks();
+            if (pendingSnapshot.empty()) return;
+
+            // The dialog's ChangeColor(loveId) ran right before this call; use that
+            // love so one love's unlocks cannot mark another love's endings.
+            const auto loveId = GetAchievementDialogLoveId();
+
+            Il2cppUtils::Tools::CSListEditor<void*> editor(storyEndInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            int marked = 0;
+            for (int i = 0; i < count; ++i) {
+                if (ApplyPendingToStoryEndInfo(editor.get_Item(i), loveId, pendingSnapshot)) {
+                    ++marked;
+                }
+            }
+
+            if (marked > 0) {
+                Log::InfoFmt("LoveRefresh: marked %d ending(s) unlocked for achievement dialog", marked);
+            }
+        }
+
+        // Returns true when the hook queued at least one unlock for a finish that
+        // the original EvaluateEndAsync classified as an ending.
+        bool RecordEndingUnlocks(void* finishResponse, bool isEnding) {
+            if (!isEnding) return false;
+            if (!finishResponse || !IsInstanceOf(finishResponse, "LoveFinishResponse")) return false;
+
+            const auto storyEndNameField = FindField("Solis.Common.Proto.Api", "LoveFinishResponse", "storyEndName_");
+            const auto commonResponseField = FindField("Solis.Common.Proto.Api", "LoveFinishResponse", "commonResponse_");
+            const auto updatedDataField = FindField("Solis.Common.Proto.Api", "CommonResponse", "updatedData_");
+            const auto lovesField = FindField("Solis.Common.Proto.Api", "UpdatedData", "loves_");
+            const auto userLoveIdField = FindField("Solis.Common.Proto.Transaction", "UserLove", "loveId_");
+            const auto unlockedIdsField = FindField("Solis.Common.Proto.Transaction", "UserLove", "unlockedLoveStoryEndIDs_");
+
+            const auto endName = ReadStringField(finishResponse, storyEndNameField);
+
+            bool recordedIds = false;
+            const auto commonResponse = commonResponseField
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(finishResponse, commonResponseField) : nullptr;
+            const auto updatedData = (commonResponse && updatedDataField)
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(commonResponse, updatedDataField) : nullptr;
+            const auto loves = (updatedData && lovesField)
+                    ? Il2cppUtils::ClassGetFieldValue<void*>(updatedData, lovesField) : nullptr;
+
+            if (loves && userLoveIdField && unlockedIdsField) {
+                Il2cppUtils::Tools::CSListEditor<void*> loveEditor(loves);
+                const int loveCount = loveEditor.get_Count();
+                for (int i = 0; i < loveCount && i < 1000; ++i) {
+                    const auto userLove = loveEditor.get_Item(i);
+                    if (!userLove) continue;
+
+                    const auto loveId = ReadStringField(userLove, userLoveIdField);
+                    const auto unlockedIds = Il2cppUtils::ClassGetFieldValue<void*>(userLove, unlockedIdsField);
+                    if (!unlockedIds) continue;
+
+                    Il2cppUtils::Tools::CSListEditor<Il2cppString*> idEditor(unlockedIds);
+                    const int idCount = idEditor.get_Count();
+                    for (int j = 0; j < idCount && j < 1000; ++j) {
+                        const auto endId = idEditor.get_Item(j);
+                        if (!endId) continue;
+                        const auto id = endId->ToString();
+                        if (id.empty()) continue;
+                        AddPendingUnlock(loveId, id, {});
+                        recordedIds = true;
+                    }
+                }
+            }
+
+            // LoveFinishResponse has no LoveId, so fall back to the ending name only
+            // when the response did not carry any UnlockedLoveStoryEndIDs. If the
+            // ending finish carried neither, there is nothing to record.
+            if (!recordedIds) {
+                if (endName.empty()) {
+                    Log::Info("LoveRefresh: ending finish carried no StoryEndName or unlock ids");
+                    return false;
+                }
+                AddPendingUnlock({}, {}, endName);
+            }
+
+            // The cached list is deliberately not touched here: the title screen
+            // model may already be destroyed by the adv player. Pending entries
+            // are applied on the next live access (get_LoveInfos, character
+            // select transition, achievement dialog, cell bind).
+            Log::InfoFmt("LoveRefresh: ending recorded (fromUnlockedIds=%d)", recordedIds ? 1 : 0);
+            return true;
+        }
+
+        void RequestLoveTopRefresh() {
+            if (!Config::privateServerEnabled) return;
+
+            const auto presenter = GetLoveWindowPresenter();
+            if (!presenter) {
+                Log::Error("LoveRefresh: LoveWindowPresenter not captured, skipping Love:Top refresh");
+                return;
+            }
+            if (!IsInstanceOf(presenter, "LoveWindowPresenter")) {
+                Log::Error("LoveRefresh: stale LoveWindowPresenter, skipping Love:Top refresh");
+                ClearLoveWindowPresenter();
+                return;
+            }
+
+            static const auto requestMethod = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter",
+                    "RequestLoveTopResponseAsync", {"*"});
+            if (!requestMethod || !requestMethod->function) {
+                Log::Error("LoveRefresh: LoveWindowPresenter.RequestLoveTopResponseAsync not found");
+                return;
+            }
+
+            loveTopRefreshPending.store(true);
+            SolisCancellationToken cancellationToken{};
+            // il2cpp instance methods take a trailing MethodInfo*. Passing null is
+            // safe here (the async starter does not need it) and keeps the raw
+            // function-pointer call ABI-correct.
+            SolisUniTask request{};
+            try {
+                request = requestMethod->Invoke<SolisUniTask>(
+                        presenter, cancellationToken, static_cast<void*>(nullptr));
+            } catch (...) {
+                request = {};
+            }
+            // A failed/throwing invoke leaves a default task (null source). Do not
+            // leave the pending flag armed, or the next unrelated Top would consume it.
+            if (!request.source) {
+                loveTopRefreshPending.store(false);
+                Log::Error("LoveRefresh: Love:Top refresh request failed; pending flag reset");
+                return;
+            }
+            Log::InfoFmt("LoveRefresh: requested Love:Top refresh after ending (#%d)",
+                         loveTopRefreshCount.fetch_add(1) + 1);
+        }
+
+        // Extra loves (LoveBaseType.Extra = 2, e.g. MoshiKoi "love-extra-25-0426")
+        // read their loading-screen logo/icon/background only from the window's
+        // ReusableAssetKeeper (GetExtraLoadingData / GetExtraBackgroundTexture).
+        // The client fills that cache only in LoadExtraDataAsync, which is called
+        // solely from LoveExtraTitleScreenPresenter (the Home event-banner entry).
+        // The private server lists extras in the normal Love menu instead, so the
+        // standard SetLoveInfoAsync path never loads them and the logo stays blank.
+        // Start the client's own LoadExtraDataAsync (fire-and-forget; it only loads
+        // assets into the keeper) whenever an extra love is set on the window.
+        constexpr int kLoveBaseTypeExtra = 2;
+
+        void PreloadExtraLoveData(void* presenter, void* loveInfo, SolisCancellationToken cancellationToken) {
+            if (!Config::privateServerEnabled) return;
+            if (!presenter || !loveInfo) return;
+            if (!IsInstanceOf(presenter, "LoveWindowPresenter") || !IsInstanceOf(loveInfo, "LoveInfo")) return;
+
+            const auto baseTypeField = FindField("Solis.Common.Proto.Api", "LoveInfo", "baseType_");
+            if (!baseTypeField) return;
+            const auto baseType = Il2cppUtils::ClassGetFieldValue<int32_t>(loveInfo, baseTypeField);
+            if (baseType != kLoveBaseTypeExtra) return;
+
+            const auto assetIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "assetId_");
+            const auto loveIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "loveId_");
+            const auto assetId = ReadStringField(loveInfo, assetIdField);
+            const auto loveId = ReadStringField(loveInfo, loveIdField);
+            if (assetId.empty()) {
+                Log::ErrorFmt("LoveExtra: %s has no AssetId, skipping extra data preload", loveId.c_str());
+                return;
+            }
+
+            static const auto loadMethod = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter",
+                    "LoadExtraDataAsync", {"*", "*"});
+            if (!loadMethod || !loadMethod->function) {
+                Log::Error("LoveExtra: LoveWindowPresenter.LoadExtraDataAsync not found");
+                return;
+            }
+
+            SolisUniTask task{};
+            try {
+                task = loadMethod->Invoke<SolisUniTask>(
+                        presenter, loveInfo, cancellationToken, static_cast<void*>(nullptr));
+            } catch (...) {
+                task = {};
+            }
+            if (!task.source) {
+                // A synchronously completed UniTask also has a null source, so this
+                // is informational rather than a failure.
+                Log::InfoFmt("LoveExtra: LoadExtraDataAsync returned a completed task for %s (asset %s)",
+                             loveId.c_str(), assetId.c_str());
+                return;
+            }
+            Log::InfoFmt("LoveExtra: started extra data preload for %s (asset %s)",
+                         loveId.c_str(), assetId.c_str());
+        }
+
+        // A fresh Love window starts with an empty asset keeper, and the extra
+        // love's front loading screen is short, so loading only when the love is
+        // opened makes the logo pop in right before that screen fades. Start the
+        // preload as soon as the Love menu has its list, so the keeper is filled
+        // before the user picks the extra love. Once per window and asset.
+        void PreloadExtraLovesFromList(void* loveInfos, const char* when) {
+            if (!Config::privateServerEnabled) return;
+            if (!loveInfos || !IsInstanceOf(loveInfos, "List`1")) return;
+            Il2cppUtils::Tools::CSListEditor<void*> editor(loveInfos);
+            const int count = editor.get_Count();
+            if (count <= 0 || count > 1000) return;
+
+            const auto baseTypeField = FindField("Solis.Common.Proto.Api", "LoveInfo", "baseType_");
+            const auto assetIdField = FindField("Solis.Common.Proto.Api", "LoveInfo", "assetId_");
+            if (!baseTypeField || !assetIdField) return;
+
+            void* presenter = nullptr;
+            for (int i = 0; i < count; ++i) {
+                const auto loveInfo = editor.get_Item(i);
+                if (!loveInfo || !IsInstanceOf(loveInfo, "LoveInfo")) continue;
+                if (Il2cppUtils::ClassGetFieldValue<int32_t>(loveInfo, baseTypeField) != kLoveBaseTypeExtra) continue;
+                const auto assetId = ReadStringField(loveInfo, assetIdField);
+                if (assetId.empty()) continue;
+                if (!presenter) {
+                    presenter = GetLoveWindowPresenter();
+                    if (!presenter) {
+                        Log::InfoFmt("LoveExtra: no Love window yet, skipping early preload (%s)", when);
+                        return;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(presenterMutex);
+                    if (!earlyPreloadedAssets.insert(assetId).second) continue;
+                }
+                Log::InfoFmt("LoveExtra: early preload of %s (%s)", assetId.c_str(), when);
+                PreloadExtraLoveData(presenter, loveInfo, SolisCancellationToken{});
+            }
+        }
+
+        // SetLoveInfoAsync copies the extra textures into the window's front
+        // loading screen synchronously, right after the preload above starts. When
+        // the window is fresh (e.g. opened from the Home Idol page) the async load
+        // has not finished yet, so the copy is empty. Re-copy them from the keeper
+        // just before the loading screen is shown, when the load has completed.
+        struct ExtraLoadingTextures {
+            void* logo;
+            void* icon;
+        };
+
+        // loading == nullptr means "whatever front loading the presenter's view owns"
+        // (used when the preload finishes while the loading screen is up).
+        void RefreshExtraFrontLoading(void* presenter, void* loading, const char* when) {
+            if (!Config::privateServerEnabled) return;
+            if (!presenter || !IsInstanceOf(presenter, "LoveWindowPresenter")) return;
+
+            static const auto getView = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "get_View");
+            static const auto getLoadingData = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetExtraLoadingData");
+            static const auto getBackground = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetExtraBackgroundTexture");
+            static const auto setExtraData = Il2cppUtils::GetMethod(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveFullScreenLoading", "SetExtraData",
+                    {"*", "*", "*"});
+            if (!getView || !getView->function || !getLoadingData || !getLoadingData->function ||
+                !getBackground || !getBackground->function || !setExtraData || !setExtraData->function) {
+                Log::Error("LoveExtra: front loading refresh methods not found");
+                return;
+            }
+
+            try {
+                // Only touch the loading screen that belongs to the cached window.
+                const auto view = getView->Invoke<void*>(presenter, static_cast<void*>(nullptr));
+                const auto frontLoadingField = FindField("Solis.OutGame", "LoveWindowView", "_frontLoading");
+                if (!view || !frontLoadingField) return;
+                const auto frontLoading = Il2cppUtils::ClassGetFieldValue<void*>(view, frontLoadingField);
+                if (!frontLoading || !IsInstanceOf(frontLoading, "LoveFullScreenLoading")) return;
+                if (loading && frontLoading != loading) return;
+
+                const auto baseTypeField = FindField("Solis.OutGame", "LoveFullScreenLoading", "_baseType");
+                if (!baseTypeField) return;
+                if (Il2cppUtils::ClassGetFieldValue<int32_t>(frontLoading, baseTypeField) != kLoveBaseTypeExtra) return;
+
+                const auto textures = getLoadingData->Invoke<ExtraLoadingTextures>(
+                        presenter, static_cast<void*>(nullptr));
+                if (!textures.logo) {
+                    Log::InfoFmt("LoveExtra: extra logo not loaded yet (%s)", when);
+                    return;
+                }
+                const auto background = getBackground->Invoke<void*>(presenter, static_cast<void*>(nullptr));
+                setExtraData->Invoke<void>(frontLoading, background, textures.logo, textures.icon,
+                                           static_cast<void*>(nullptr));
+                Log::InfoFmt("LoveExtra: refreshed extra logo on the front loading screen (%s)", when);
+            } catch (...) {
+                Log::Error("LoveExtra: front loading refresh threw; leaving loading screen as is");
+            }
+        }
+
+        // The front loading screen is shown ~immediately after SetLoveInfoAsync, long
+        // before the preload finishes, so also refresh when LoadExtraDataAsync's state
+        // machine (<LoadExtraDataAsync>d__NN, a struct) completes. Its MoveNext gets the
+        // unboxed struct, so il2cpp field offsets (which include the object header)
+        // are rebased by two pointers.
+        struct LoadExtraStateMachineLayout {
+            int stateOffset = -1;
+            int thisOffset = -1;
+        };
+        LoadExtraStateMachineLayout loadExtraLayout;
+
+        void* ResolveLoadExtraMoveNext() {
+            const auto presenterClass = Il2cppUtils::GetClass("Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter");
+            if (!presenterClass || !presenterClass->address) return nullptr;
+            const auto nested = Il2cppUtils::find_nested_class(presenterClass->address, [](void* klass) {
+                const auto name = static_cast<Il2cppUtils::Il2CppClassHead*>(klass)->name;
+                return name && std::string_view(name).starts_with("<LoadExtraDataAsync>d__");
+            });
+            if (!nested) {
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine not found");
+                return nullptr;
+            }
+            const auto stateField = UnityResolve::Invoke<void*>("il2cpp_class_get_field_from_name", nested, "<>1__state");
+            const auto thisField = UnityResolve::Invoke<void*>("il2cpp_class_get_field_from_name", nested, "<>4__this");
+            const bool isValueType = UnityResolve::Invoke<bool>("il2cpp_class_is_valuetype", nested);
+            if (!stateField || !thisField || !isValueType) {
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine layout unexpected");
+                return nullptr;
+            }
+            constexpr int kHeader = static_cast<int>(2 * sizeof(void*));
+            loadExtraLayout.stateOffset = UnityResolve::Invoke<int>("il2cpp_field_get_offset", stateField) - kHeader;
+            loadExtraLayout.thisOffset = UnityResolve::Invoke<int>("il2cpp_field_get_offset", thisField) - kHeader;
+            if (loadExtraLayout.stateOffset < 0 || loadExtraLayout.thisOffset < 0) {
+                loadExtraLayout = {};
+                Log::Error("LoveExtra: <LoadExtraDataAsync> state machine offsets invalid");
+                return nullptr;
+            }
+            const auto moveNext = Il2cppUtils::il2cpp_class_get_method_pointer_from_name(nested, "MoveNext", 0);
+            return reinterpret_cast<void*>(moveNext);
+        }
+
+        void OnLoadExtraMoveNext(void* stateMachine) {
+            if (!Config::privateServerEnabled || !stateMachine) return;
+            if (loadExtraLayout.stateOffset < 0 || loadExtraLayout.thisOffset < 0) return;
+            const auto base = static_cast<std::byte*>(stateMachine);
+            int32_t state;
+            void* presenter;
+            std::memcpy(&state, base + loadExtraLayout.stateOffset, sizeof(state));
+            std::memcpy(&presenter, base + loadExtraLayout.thisOffset, sizeof(presenter));
+            if (state != -2 || !presenter) return;  // -2: finished (success or fault)
+            if (presenter != GetLoveWindowPresenter()) return;
+            RefreshExtraFrontLoading(presenter, nullptr, "preload finished");
+        }
+    }
+
+    DEFINE_HOOK(void*, LoveWindowPresenter_get_Model, (void* self, void* mtd)) {
+        const auto ret = LoveWindowPresenter_get_Model_Orig(self, mtd);
+        LoveRefresh::CaptureLoveWindowPresenter(self);
+        return ret;
+    }
+
+    DEFINE_HOOK(void*, LoveWindowPresenter_GetLoveTopResponse, (void* self, void* mtd)) {
+        const auto ret = LoveWindowPresenter_GetLoveTopResponse_Orig(self, mtd);
+        LoveRefresh::CaptureLoveWindowPresenter(self);
+        return ret;
+    }
+
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_InitializeAsync,
+                (void* self, void* param, SolisCancellationToken cancellationToken, void* mtd)) {
+        LoveRefresh::CaptureLoveWindowPresenter(self);
+        return LoveWindowPresenter_InitializeAsync_Orig(self, param, cancellationToken, mtd);
+    }
+
+    // Close path for the window that was cached above. The async state machine
+    // (<OnCloseOutAsync>d__34) keeps the presenter alive, so clearing the rooted
+    // pointer right after the original starts is safe.
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_OnCloseOutAsync,
+                (void* self, void* info, SolisCancellationToken cancellationToken, void* mtd)) {
+        const auto ret = LoveWindowPresenter_OnCloseOutAsync_Orig(self, info, cancellationToken, mtd);
+        LoveRefresh::ClearLoveWindowPresenterIfMatches(self);
+        return ret;
+    }
+
+    // Standard Love-menu entry (LoveGameStartScreenPresenterBase.MoveLoveHomeScreenAsync
+    // -> SetLoveInfoAsync). Kick off the extra-love asset preload before the
+    // original runs so the keeper is filled by the time the loading screen reads it.
+    DEFINE_HOOK(SolisUniTask, LoveWindowPresenter_SetLoveInfoAsync,
+                (void* self, void* loveInfo, SolisCancellationToken cancellationToken, void* mtd)) {
+        LoveRefresh::PreloadExtraLoveData(self, loveInfo, cancellationToken);
+        return LoveWindowPresenter_SetLoveInfoAsync_Orig(self, loveInfo, cancellationToken, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveFullScreenLoading_StartLoading, (void* self, void* mtd)) {
+        LoveRefresh::RefreshExtraFrontLoading(LoveRefresh::GetLoveWindowPresenter(), self, "StartLoading");
+        LoveFullScreenLoading_StartLoading_Orig(self, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveWindowPresenter_LoadExtraDataAsync_MoveNext, (void* self, void* mtd)) {
+        LoveWindowPresenter_LoadExtraDataAsync_MoveNext_Orig(self, mtd);
+        LoveRefresh::OnLoadExtraMoveNext(self);
+    }
+
+    DEFINE_HOOK(void, LoveWindowModel_SetLoveTopResponse, (void* self, void* response, void* mtd)) {
+        LoveWindowModel_SetLoveTopResponse_Orig(self, response, mtd);
+        if (!Config::privateServerEnabled) return;
+        if (!LoveRefresh::loveTopRefreshPending.exchange(false)) return;
+
+        int episodeCount = 0;
+        const auto episodeIdsField = LoveRefresh::FindField(
+                "Solis.Common.Proto.Api", "LoveTopResponse", "storyEpisodeIds_");
+        const auto episodeIds = (response && episodeIdsField)
+                ? Il2cppUtils::ClassGetFieldValue<void*>(response, episodeIdsField) : nullptr;
+        if (episodeIds) {
+            Il2cppUtils::Tools::CSListEditor<LoveRefresh::Il2cppString*> editor(episodeIds);
+            episodeCount = editor.get_Count();
+        }
+        Log::InfoFmt("LoveRefresh: Love:Top response applied after ending (episodes=%d)", episodeCount);
+    }
+
+    DEFINE_HOOK(bool, LoveAdvPlayerScreenPresenter_EvaluateEndAsync,
+                (void* self, void* finishResponse, void* mtd)) {
+        const auto isEnding = LoveAdvPlayerScreenPresenter_EvaluateEndAsync_Orig(self, finishResponse, mtd);
+        if (!Config::privateServerEnabled) return isEnding;
+
+        if (LoveRefresh::RecordEndingUnlocks(finishResponse, isEnding)) {
+            LoveRefresh::RequestLoveTopRefresh();
+        }
+        return isEnding;
+    }
+
+    DEFINE_HOOK(void*, LoveTitleScreenModelBase_get_LoveInfos, (void* self, void* mtd)) {
+        const auto loveInfos = LoveTitleScreenModelBase_get_LoveInfos_Orig(self, mtd);
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::ApplyPendingUnlocksToList(loveInfos);
+        }
+        return loveInfos;
+    }
+
+    // The Love menu's title screen builds its model from the full LoveInfo list
+    // when it opens, seconds before the user can start a love.
+    DEFINE_HOOK(void, LoveTitleScreenModel_ctor, (void* self, void* loveInfos, void* mtd)) {
+        LoveTitleScreenModel_ctor_Orig(self, loveInfos, mtd);
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::PreloadExtraLovesFromList(loveInfos, "title screen");
+        }
+    }
+
+    DEFINE_HOOK(void, LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen,
+                (void* self, void* loveInfos, void* mtd)) {
+        if (Config::privateServerEnabled && loveInfos) {
+            LoveRefresh::ApplyPendingUnlocksToList(loveInfos);
+        }
+        LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen_Orig(self, loveInfos, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveCharacterSelectSnapListCellView_SetAchievementView,
+                (void* self, void* loveInfo, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::ApplyPendingUnlocksToLoveInfo(loveInfo);
+        }
+        LoveCharacterSelectSnapListCellView_SetAchievementView_Orig(self, loveInfo, mtd);
+    }
+
+    // The dialog's b__0 calls ChangeColor(loveInfo.LoveId) immediately before
+    // SetAchievementStatusListItemModels(loveInfo.StoryEndInfos); remember the
+    // real id so the apply pass is scoped to that love.
+    DEFINE_HOOK(void, LoveAchievementStatusDialogPresenter_ChangeColor,
+                (void* self, void* loveId, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::SetAchievementDialogLoveId(loveId);
+        }
+        LoveAchievementStatusDialogPresenter_ChangeColor_Orig(self, loveId, mtd);
+    }
+
+    DEFINE_HOOK(void, LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
+                (void* self, void* storyEndInfos, void* mtd)) {
+        if (Config::privateServerEnabled) {
+            LoveRefresh::ApplyPendingUnlocksToStoryEndInfoList(storyEndInfos);
+        }
+        LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels_Orig(
+                self, storyEndInfos, mtd);
+    }
+
     std::string GetSolisSafePhotoExpressionId(void* characterIds, const std::string& currentExpressionId = "") {
         if (!characterIds) return currentExpressionId;
 
@@ -6502,6 +7240,53 @@ namespace HoshimiLocal::HookMain {
 #endif
 
         PrivateServer::Install(hookInstaller);
+
+        // Love (MoshiKoi) refresh after an ending. Only the private server resets
+        // the route and records the cleared ending, so gate on its toggle.
+        if (Config::privateServerEnabled) {
+            ADD_HOOK(LoveWindowPresenter_get_Model, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "get_Model"));
+            ADD_HOOK(LoveWindowPresenter_GetLoveTopResponse, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "GetLoveTopResponse"));
+            ADD_HOOK(LoveWindowPresenter_InitializeAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "InitializeAsync",
+                    {"*", "*"}));
+            ADD_HOOK(LoveWindowPresenter_OnCloseOutAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "OnCloseOutAsync",
+                    {"*", "*"}));
+            ADD_HOOK(LoveWindowPresenter_SetLoveInfoAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowPresenter", "SetLoveInfoAsync",
+                    {"*", "*"}));
+            ADD_HOOK(LoveFullScreenLoading_StartLoading, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveFullScreenLoading", "StartLoading"));
+            // ADD_HOOK expands its address argument more than once, so resolve first.
+            if (const auto loadExtraMoveNext = LoveRefresh::ResolveLoadExtraMoveNext()) {
+                ADD_HOOK(LoveWindowPresenter_LoadExtraDataAsync_MoveNext, loadExtraMoveNext);
+            }
+            ADD_HOOK(LoveWindowModel_SetLoveTopResponse, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveWindowModel", "SetLoveTopResponse", {"*"}));
+            ADD_HOOK(LoveAdvPlayerScreenPresenter_EvaluateEndAsync, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveAdvPlayerScreenPresenter",
+                    "EvaluateEndAsync", {"*"}));
+            ADD_HOOK(LoveTitleScreenModelBase_get_LoveInfos, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenModelBase", "get_LoveInfos"));
+            ADD_HOOK(LoveTitleScreenPresenter_MoveLoveCharacterSelectScreen, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenPresenter",
+                    "MoveLoveCharacterSelectScreen", {"*"}));
+            ADD_HOOK(LoveTitleScreenModel_ctor, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveTitleScreenModel", ".ctor", {"*"}));
+            ADD_HOOK(LoveCharacterSelectSnapListCellView_SetAchievementView, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame", "LoveCharacterSelectSnapListCellView",
+                    "SetAchievementView", {"*"}));
+            ADD_HOOK(LoveAchievementStatusDialogPresenter_ChangeColor, Il2cppUtils::GetMethodPointer(
+                    "Assembly-CSharp.dll", "Solis.OutGame",
+                    "LoveAchievementStatusDialogPresenter", "ChangeColor", {"*"}));
+            ADD_HOOK(LoveAchievementStatusDialogPresenter_SetAchievementStatusListItemModels,
+                     Il2cppUtils::GetMethodPointer(
+                             "Assembly-CSharp.dll", "Solis.OutGame",
+                             "LoveAchievementStatusDialogPresenter",
+                             "SetAchievementStatusListItemModels", {"*"}));
+        }
 
         ADD_HOOK(SolisQualityManager_set_TargetFrameRate,
                  Il2cppUtils::GetMethodPointer("solis-submodule.Runtime.dll", "Solis.Common",
