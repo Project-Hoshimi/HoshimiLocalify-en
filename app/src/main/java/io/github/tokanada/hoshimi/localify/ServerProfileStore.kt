@@ -136,18 +136,6 @@ object ServerProfileStore {
     @Volatile
     private var clearResult: Boolean? = null
 
-    /**
-     * True when the companion module app answered `requestConfig` with private server enabled. The
-     * switch button then refuses to change anything and only explains who owns the configuration.
-     */
-    @Volatile
-    var appManagedPrivateServer: Boolean = false
-        private set
-
-    fun updateAppManaged(enabled: Boolean) {
-        appManagedPrivateServer = enabled
-    }
-
     // ---- atomic file writes --------------------------------------------------------------
 
     /**
@@ -551,24 +539,6 @@ object ServerProfileStore {
                     "into profile ${profile.id}"
         )
         return profile.id
-    }
-
-    /** Creates a private profile from a configuration the module app supplied (migration only). */
-    fun migrateFromAppConfig(filesDir: File, config: IdolyprideConfig?) {
-        if (config == null || !config.privateServerEnabled || config.privateServerUrl.isBlank()) return
-        synchronized(lock) {
-            profilesDir(filesDir).mkdirs()
-            loadProfilesLocked(filesDir)
-            if (readActiveIdLocked(filesDir) != null) return
-            val profile = buildPrivateProfile(config.privateServerUrl, config.privateServerCaPem)
-            if (profile == null) return
-            val profiles = ArrayList(loadProfilesLocked(filesDir))
-            val index = profiles.indexOfFirst { it.id == profile.id }
-            if (index >= 0) profiles[index] = profile else profiles.add(profile)
-            saveProfilesLocked(filesDir, profiles)
-            writeActiveIdLocked(filesDir, profile.id)
-            Log.i(TAG, "ServerProfileStore: migrated the module app configuration into ${profile.id}")
-        }
     }
 
     /**

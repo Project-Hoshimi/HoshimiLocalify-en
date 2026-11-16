@@ -57,13 +57,11 @@ object ServerPromptDialog {
     private var showing = false
 
     /**
-     * First-launch prompt: only while nothing has ever been selected. A server chosen through the
-     * module app has already been migrated to `active.json` by then and is not asked again.
+     * First-launch prompt: only while nothing has ever been selected in game.
      */
     fun maybeShowFirstLaunch(activity: Activity) {
         try {
             if (activity.isFinishing || activity.isDestroyed) return
-            if (ServerProfileStore.appManagedPrivateServer) return
             if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
             show(activity)
         }

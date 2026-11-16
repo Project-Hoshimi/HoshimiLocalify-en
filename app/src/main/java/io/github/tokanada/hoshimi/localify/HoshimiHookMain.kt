@@ -305,33 +305,26 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
             // The trust hooks are armed in handleLoadPackage; hand them the CA as soon as the
             // configuration is seen (usually a no-op, the launch intent already delivered it).
             // A malformed payload decodes to null and is ignored by the trust layer.
+            // The server is always chosen in game (Switch server). Any private-server fields in the
+            // module app's configuration are legacy and ignored: the in-game active profile
+            // overwrites them, and native must see that same decision.
+            var effectiveIprData = iprData
+            // "standalone-*" tells the trust layer this config is the active profile.
+            val observeSource = "standalone-profile-over-app"
             if (initConfig != null) {
                 try {
-                    // A config that enables a private server becomes a profile on first sight, so a
-                    // later switch can come back to it with the same account.
-                    ServerProfileStore.migrateFromAppConfig(activity.filesDir, initConfig)
-                }
-                catch (t: Throwable) {
-                    Log.w(TAG, "ServerProfileStore: cannot migrate the app configuration", t)
-                }
-            }
-            // The app's private-server setting wins only when it enables one; otherwise the
-            // in-game active profile decides, and native must see that same decision.
-            var effectiveIprData = iprData
-            // "standalone-*" tells the trust layer this config is the active profile, not an
-            // app configuration that enables the private server.
-            var observeSource = "iprData"
-            if (initConfig != null && !initConfig.privateServerEnabled) {
-                try {
                     ServerProfileStore.applyActiveProfile(initConfig, activity.filesDir)
-                    effectiveIprData = json.encodeToString(IdolyprideConfig.serializer(), initConfig)
-                    observeSource = "standalone-profile-over-app"
                     Log.i(TAG, "ServerProfileStore: native config follows the active profile " +
                             "(private=${initConfig.privateServerEnabled})")
                 }
                 catch (t: Throwable) {
+                    // Never fall back to the app's legacy server fields: use the official server.
                     Log.w(TAG, "ServerProfileStore: cannot apply the active profile to the app config", t)
+                    initConfig.privateServerEnabled = false
+                    initConfig.privateServerUrl = ""
+                    initConfig.privateServerCaPem = ""
                 }
+                effectiveIprData = json.encodeToString(IdolyprideConfig.serializer(), initConfig)
             }
             try {
                 PrivateServerTrust.observeConfig(initConfig, observeSource)
@@ -495,7 +488,7 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     /**
      * Latch for the first-launch picker: the prompt must wait until the app configuration was
-     * actually resolved, so it can see a profiled server chosen through the module app.
+     * actually resolved, so it can see the server already chosen in game.
      */
     private fun afterConfigResolved(activity: Activity?) {
         configResolved = true
@@ -508,7 +501,6 @@ class HoshimiHookMain : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun maybeShowFirstLaunch(activity: Activity) {
         if (!mainProcess || !configResolved || firstLaunchPromptHandled) return
         try {
-            if (ServerProfileStore.appManagedPrivateServer) return
             if (ServerProfileStore.readActiveId(activity.filesDir) != null) return
             firstLaunchPromptHandled = true
             activity.runOnUiThread {

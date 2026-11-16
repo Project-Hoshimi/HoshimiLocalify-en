@@ -218,9 +218,7 @@ object PrivateServerTrust {
         val context = appContext()
         val filesDir = context?.filesDir
         if (source.startsWith("standalone")) {
-            // Built by initStandaloneConfig from the active in-game profile: it *is* the effective
-            // configuration, so there is no app configuration to outrank it.
-            ServerProfileStore.updateAppManaged(false)
+            // Built from the active in-game profile: it *is* the effective configuration.
             applyConfig(
                 config.privateServerEnabled,
                 config.privateServerUrl,
@@ -232,31 +230,8 @@ object PrivateServerTrust {
             return
         }
 
-        // Precedence: an app configuration that enables the private server wins (unchanged
-        // behaviour for the sumire-sr dev setup). Otherwise the in-game profile decides, and an
-        // app payload with the private server off must never disarm an active private profile.
-        val appEnabled = config.privateServerEnabled && config.privateServerUrl.isNotBlank()
-        ServerProfileStore.updateAppManaged(appEnabled)
-        if (appEnabled) {
-            if (filesDir != null) {
-                try {
-                    ServerProfileStore.migrateFromAppConfig(filesDir, config)
-                }
-                catch (t: Throwable) {
-                    Log.w(TAG, "PrivateServerTrust: cannot migrate the app configuration", t)
-                }
-            }
-            applyConfig(
-                true,
-                config.privateServerUrl,
-                config.privateServerCaPem,
-                source,
-                context,
-                cacheSource = CACHE_SOURCE_APP
-            )
-            return
-        }
-
+        // A raw module-app payload: the server is always chosen in game, so its private-server
+        // fields are ignored and only the in-game active profile decides.
         val profile = if (filesDir == null) {
             null
         }
@@ -653,16 +628,13 @@ object PrivateServerTrust {
         }
         val file = File(context.filesDir, CACHE_FILE_NAME)
         // Once active.json exists, the profile store owns the decision. If it resolves to the
-        // official server and the app has not enabled a private server in this process, the legacy
-        // cache file must never arm trust (and is removed). The legacy fallback is only for the
-        // pre-migration case where active.json does not exist yet.
-        if (ServerProfileStore.hasActiveId(context.filesDir) &&
-            !ServerProfileStore.appManagedPrivateServer
-        ) {
+        // official server, the legacy cache file must never arm trust (and is removed). The legacy
+        // fallback is only for the pre-migration case where active.json does not exist yet.
+        if (ServerProfileStore.hasActiveId(context.filesDir)) {
             Log.i(
                 TAG,
-                "PrivateServerTrust: active.json selects a non-private server and the app has not " +
-                        "enabled the private server; refusing the cached CA ($source)"
+                "PrivateServerTrust: active.json selects a non-private server; " +
+                        "refusing the cached CA ($source)"
             )
             deleteCachedCa(file)
             return

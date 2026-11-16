@@ -12,7 +12,6 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.Toast
 import java.lang.ref.WeakReference
 
 /**
@@ -39,7 +38,6 @@ object ServerSwitchOverlay {
     private const val FALLBACK_TOP_MARGIN_DP = 32
 
     private const val BUTTON_TEXT = "Switch server"
-    private const val MANAGED_MESSAGE = "Server is managed by the HoshimiLocalify app"
     private const val MARGIN_DP = 12
     private const val PADDING_H_DP = 12
     private const val PADDING_V_DP = 4
@@ -119,10 +117,6 @@ object ServerSwitchOverlay {
 
     private fun onButtonClicked(activity: Activity) {
         try {
-            if (ServerProfileStore.appManagedPrivateServer) {
-                Toast.makeText(activity, MANAGED_MESSAGE, Toast.LENGTH_SHORT).show()
-                return
-            }
             ServerPromptDialog.show(activity)
         }
         catch (t: Throwable) {
