@@ -27,6 +27,8 @@
 #include <chrono>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 
 std::unordered_set<void*> hookedStubs{};
 extern std::filesystem::path hoshimiLocalPath;
@@ -4130,6 +4132,9 @@ namespace HoshimiLocal::HookMain {
 
         std::mutex fieldMutex;
         std::unordered_map<std::string, UnityResolve::Field*> fieldCache;
+        // Field names already reported as missing. Misses are not cached (a class
+        // may not be initialized yet), but logging every retry would flood the log.
+        std::unordered_set<std::string> loggedFieldMisses;
 
         UnityResolve::Field* FindField(const char* nameSpace, const char* className, const char* fieldName) {
             const std::string key = std::string(nameSpace) + "::" + className + "." + fieldName;
@@ -4142,7 +4147,12 @@ namespace HoshimiLocal::HookMain {
             const auto klass = Il2cppUtils::GetClass("Assembly-CSharp.dll", nameSpace, className);
             const auto field = klass ? klass->Get<UnityResolve::Field>(fieldName) : nullptr;
             if (!field) {
-                Log::ErrorFmt("LoveRefresh: field %s not found", key.c_str());
+                bool shouldLog = false;
+                {
+                    std::lock_guard<std::mutex> lock(fieldMutex);
+                    shouldLog = loggedFieldMisses.insert(key).second;
+                }
+                if (shouldLog) Log::ErrorFmt("LoveRefresh: field %s not found", key.c_str());
                 // A miss may be transient (class not initialized yet), so retry on
                 // the next lookup instead of poisoning the cache with nullptr.
                 return nullptr;
@@ -4282,6 +4292,9 @@ namespace HoshimiLocal::HookMain {
         }
 
         void AddPendingUnlock(const std::string& loveId, const std::string& endId, const std::string& endName) {
+            // Every pending entry is scoped to a love; an entry without a love id could
+            // only ever match by name, which would span every love.
+            if (loveId.empty()) return;
             if (endId.empty() && endName.empty()) return;
 
             std::lock_guard<std::mutex> lock(pendingMutex);
@@ -4295,21 +4308,29 @@ namespace HoshimiLocal::HookMain {
         }
 
         bool MatchesPending(const PendingUnlock& pending, const std::string& loveId,
-                            const std::string& endId, const std::string& endName) {
-            // An empty actual LoveId means the caller only knows the ending entry
-            // (e.g. the details dialog list), so match on the ending id alone.
-            if (!pending.loveId.empty() && !loveId.empty() && pending.loveId != loveId) return false;
-            if (!pending.endId.empty()) return pending.endId == endId;
-            return !pending.endName.empty() && pending.endName == endName;
+                            const std::string& endId, const std::string& /*endName*/) {
+            // Pending entries always carry a love id, so an entry without one is stale
+            // and must never match. A caller that can name the love has to agree with
+            // the entry; a caller that cannot (loveId empty) matches by ending id only.
+            if (pending.loveId.empty() || pending.endId.empty()) return false;
+            if (pending.endId != endId) return false;
+            if (!loveId.empty() && pending.loveId != loveId) return false;
+            return true;
         }
 
         bool ApplyPendingToStoryEndInfo(void* endInfo, const std::string& loveId,
                                         const std::vector<PendingUnlock>& pendingSnapshot) {
             if (!endInfo || !IsInstanceOf(endInfo, "LoveStoryEndInfo")) return false;
 
-            const auto endIdField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "id_");
-            const auto endNameField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "name_");
-            const auto unlockedField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "unlocked_");
+            // Resolved once: this runs per ending entry on every list access. Only
+            // successful lookups are cached; a null handle must be retried because
+            // the class may not be initialized yet.
+            static UnityResolve::Field* endIdField = nullptr;
+            static UnityResolve::Field* endNameField = nullptr;
+            static UnityResolve::Field* unlockedField = nullptr;
+            if (!endIdField) endIdField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "id_");
+            if (!endNameField) endNameField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "name_");
+            if (!unlockedField) unlockedField = FindField("Solis.Common.Proto.Api", "LoveStoryEndInfo", "unlocked_");
             if (!endIdField || !endNameField || !unlockedField) return false;
 
             const auto endId = ReadStringField(endInfo, endIdField);
@@ -4333,10 +4354,8 @@ namespace HoshimiLocal::HookMain {
             return pendingUnlocks;
         }
 
-        void ApplyPendingUnlocksToLoveInfo(void* loveInfo) {
+        void ApplyPendingUnlocksToLoveInfo(void* loveInfo, const std::vector<PendingUnlock>& pendingSnapshot) {
             if (!loveInfo || !IsInstanceOf(loveInfo, "LoveInfo")) return;
-
-            const auto pendingSnapshot = SnapshotPendingUnlocks();
             if (pendingSnapshot.empty()) return;
 
             const auto storyEndInfosField = FindField("Solis.Common.Proto.Api", "LoveInfo", "storyEndInfos_");
@@ -4363,14 +4382,24 @@ namespace HoshimiLocal::HookMain {
             }
         }
 
+        // Single-love entry point (a lone LoveInfo handed over by a hook): snapshot
+        // once for this call. List callers use the overload above so the pending
+        // list is copied once per list instead of once per love.
+        void ApplyPendingUnlocksToLoveInfo(void* loveInfo) {
+            ApplyPendingUnlocksToLoveInfo(loveInfo, SnapshotPendingUnlocks());
+        }
+
         void ApplyPendingUnlocksToList(void* loveInfos) {
             if (!loveInfos || !IsInstanceOf(loveInfos, "List`1")) return;
+
+            const auto pendingSnapshot = SnapshotPendingUnlocks();
+            if (pendingSnapshot.empty()) return;
 
             Il2cppUtils::Tools::CSListEditor<void*> editor(loveInfos);
             const int count = editor.get_Count();
             if (count <= 0 || count > 1000) return;
             for (int i = 0; i < count; ++i) {
-                ApplyPendingUnlocksToLoveInfo(editor.get_Item(i));
+                ApplyPendingUnlocksToLoveInfo(editor.get_Item(i), pendingSnapshot);
             }
         }
 
@@ -4403,8 +4432,9 @@ namespace HoshimiLocal::HookMain {
             }
         }
 
-        // Returns true when the hook queued at least one unlock for a finish that
-        // the original EvaluateEndAsync classified as an ending.
+        // Returns true when a finish the original EvaluateEndAsync classified as an
+        // ending actually cleared, so the caller refreshes Love:Top. Unlocks are only
+        // queued when they can be scoped to a love id.
         bool RecordEndingUnlocks(void* finishResponse, bool isEnding) {
             if (!isEnding) return false;
             if (!finishResponse || !IsInstanceOf(finishResponse, "LoveFinishResponse")) return false;
@@ -4450,22 +4480,25 @@ namespace HoshimiLocal::HookMain {
                 }
             }
 
-            // LoveFinishResponse has no LoveId, so fall back to the ending name only
-            // when the response did not carry any UnlockedLoveStoryEndIDs. If the
-            // ending finish carried neither, there is nothing to record.
+            // LoveFinishResponse carries no LoveId, so an ending name on its own cannot
+            // be attributed to a love. Queueing it would unlock the same-named ending
+            // of every love, so drop it and record a single log line instead. The clear
+            // itself still happened, so the caller keeps its Love:Top refresh.
             if (!recordedIds) {
                 if (endName.empty()) {
-                    Log::Info("LoveRefresh: ending finish carried no StoryEndName or unlock ids");
+                    Log::Info("LoveRefresh: ending finish carried no unlock ids and no StoryEndName, nothing queued");
                     return false;
                 }
-                AddPendingUnlock({}, {}, endName);
+                Log::InfoFmt("LoveRefresh: ending finish could not be attributed to a love id (StoryEndName=%s)",
+                             endName.c_str());
+                return true;
             }
 
             // The cached list is deliberately not touched here: the title screen
             // model may already be destroyed by the adv player. Pending entries
             // are applied on the next live access (get_LoveInfos, character
             // select transition, achievement dialog, cell bind).
-            Log::InfoFmt("LoveRefresh: ending recorded (fromUnlockedIds=%d)", recordedIds ? 1 : 0);
+            Log::Info("LoveRefresh: ending recorded (from unlock ids)");
             return true;
         }
 
