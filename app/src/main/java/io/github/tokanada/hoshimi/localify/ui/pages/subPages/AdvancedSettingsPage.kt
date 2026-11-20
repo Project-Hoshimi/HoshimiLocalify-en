@@ -115,7 +115,6 @@ fun AdvanceSettingsPage(modifier: Modifier = Modifier,
 
         if (BuildConfig.ENABLE_BREAST_PARAM) {
         item {
-            if (config.value.dbgMode) {
                 IPGroupBox(modifier, stringResource(R.string.breast_param),
                 contentPadding = 0.dp,
                 onHeadClick = {
@@ -380,7 +379,6 @@ fun AdvanceSettingsPage(modifier: Modifier = Modifier,
 
                     }
                 }
-            }
         }
 
         }
