@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 #include "camera/camera.hpp"
 #include "config/Config.hpp"
 // #include <jni.h>
@@ -6010,6 +6011,160 @@ namespace HoshimiLocal::HookMain {
     }
 #endif
 
+#if ENABLE_BREAST_PARAM
+    // The game's breast physics (ActorSwing.ActorSwingJob, a Burst job) advances exactly one fixed
+    // step per animation evaluation, so it runs faster at higher frame rates. We keep a "committed"
+    // copy of the job's NativeList<ActorSwingJobBreastBone> and, on frames that must not count as a
+    // physics tick, restore that copy so the extra simulation step is discarded.
+    namespace BreastPhysicsRate {
+        struct RigState {
+            void* listPtr = nullptr;
+            int32_t length = 0;
+            std::vector<uint8_t> committed;
+            bool dirty = true;
+            bool pendingCommit = false;
+            float acc = 0.0f;
+            int32_t lastFrame = -1;
+        };
+        std::unordered_map<void*, RigState> g_states; // main thread only
+
+        namespace {
+            struct Fields {
+                UnityResolve::Field* job = nullptr;
+                UnityResolve::Field* breastBones = nullptr;
+                size_t elemSize = 0x13C;
+                bool resolved = false;
+                bool attempted = false;
+            };
+
+            Fields& GetFields() {
+                static Fields fields;
+                if (fields.resolved || fields.attempted) return fields;
+                fields.attempted = true;
+
+                auto rigKlass = Il2cppUtils::GetClass("ActorSwing.Runtime.dll", "ActorSwing", "ActorSwingRig");
+                auto jobKlass = Il2cppUtils::GetClass("ActorSwing.Runtime.dll", "ActorSwing", "ActorSwingJob");
+                auto boneKlass = Il2cppUtils::GetClass("ActorSwing.Runtime.dll", "ActorSwing",
+                                                       "ActorSwingJobBreastBone");
+                if (!rigKlass || !jobKlass || !boneKlass) {
+                    Log::Error("BreastPhysicsRate: ActorSwing classes not found; fixed-rate physics disabled.");
+                    return fields;
+                }
+
+                fields.job = rigKlass->Get<UnityResolve::Field>("_job");
+                fields.breastBones = jobKlass->Get<UnityResolve::Field>("breastBones");
+                if (!fields.job || !fields.breastBones) {
+                    Log::Error("BreastPhysicsRate: _job / breastBones fields not found; fixed-rate physics disabled.");
+                    return fields;
+                }
+
+                uint32_t align = 0;
+                const uint32_t valueSize = UnityResolve::Invoke<uint32_t>("il2cpp_class_value_size",
+                                                                          boneKlass->address, &align);
+                size_t elemSize = static_cast<size_t>(valueSize);
+                if (elemSize < 0x100 || elemSize > 0x400) elemSize = 0x13C;
+                fields.elemSize = elemSize;
+
+                Log::InfoFmt("BreastPhysicsRate: _job offset=0x%X breastBones offset=0x%X elementSize=0x%X",
+                             static_cast<unsigned>(fields.job->offset),
+                             static_cast<unsigned>(fields.breastBones->offset),
+                             static_cast<unsigned>(fields.elemSize));
+                fields.resolved = true;
+                return fields;
+            }
+
+            using FrameCountFn = int32_t (*)();
+
+            FrameCountFn GetFrameCount() {
+                static FrameCountFn fn = reinterpret_cast<FrameCountFn>(
+                        Il2cppUtils::il2cpp_resolve_icall("UnityEngine.Time::get_frameCount()"));
+                return fn;
+            }
+        }
+
+        void ApplyBreastPhysicsRate(void* rig) {
+            if (!rig) return;
+
+            if (!Config::enableBreastParam || !Config::bLockPhysicsFps || Config::bPhysicsFps <= 0) {
+                g_states.erase(rig);
+                return;
+            }
+
+            auto& fields = GetFields();
+            if (!fields.resolved) return;
+
+            auto frameFn = GetFrameCount();
+            if (!frameFn) return;
+
+            const int32_t frame = frameFn();
+            auto& st = g_states[rig];
+            if (st.lastFrame == frame) return;
+            st.lastFrame = frame;
+
+            void* jobObj = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(rig) + fields.job->offset);
+            if (!jobObj) {
+                g_states.erase(rig);
+                return;
+            }
+
+            uint8_t* nativeList = reinterpret_cast<uint8_t*>(jobObj) + fields.breastBones->offset;
+            uint8_t* unsafeList = *reinterpret_cast<uint8_t**>(nativeList);
+            if (!unsafeList) return;
+
+            void* ptr = *reinterpret_cast<void**>(unsafeList);
+            const int32_t len = *reinterpret_cast<int32_t*>(unsafeList + 8);
+            if (!ptr || len <= 0 || len > 8) return;
+
+            const size_t bytes = static_cast<size_t>(len) * fields.elemSize;
+
+            if (st.dirty || ptr != st.listPtr || len != st.length || st.committed.size() != bytes) {
+                st.committed.resize(bytes);
+                std::memcpy(st.committed.data(), ptr, bytes);
+                st.listPtr = ptr;
+                st.length = len;
+                st.dirty = false;
+                st.acc = 0.0f;
+            }
+            else if (st.pendingCommit) {
+                std::memcpy(st.committed.data(), ptr, bytes);
+            }
+            else {
+                std::memcpy(ptr, st.committed.data(), bytes);
+            }
+
+            const int fps = std::clamp(Config::bPhysicsFps, 1, 240);
+            const float step = 1.0f / static_cast<float>(fps);
+            float dt = UnityResolve::UnityType::Time::GetDeltaTime();
+            if (!(dt > 0)) dt = 0;
+            st.acc += dt;
+            if (st.acc >= step) {
+                st.acc -= step;
+                if (st.acc > step) st.acc = step;
+                st.pendingCommit = true;
+            }
+            else {
+                st.pendingCommit = false;
+            }
+        }
+    }
+
+    DEFINE_HOOK(void, ActorSwingRig_UpdateConstraints, (void* self, void* mtd)) {
+        BreastPhysicsRate::ApplyBreastPhysicsRate(self);
+        ActorSwingRig_UpdateConstraints_Orig(self, mtd);
+    }
+
+    DEFINE_HOOK(void, ActorSwingRig_ResetBreastBone, (void* self, void* mtd)) {
+        ActorSwingRig_ResetBreastBone_Orig(self, mtd);
+        auto it = BreastPhysicsRate::g_states.find(self);
+        if (it != BreastPhysicsRate::g_states.end()) it->second.dirty = true;
+    }
+
+    DEFINE_HOOK(void, ActorSwingRig_Destroy, (void* self, void* mtd)) {
+        BreastPhysicsRate::g_states.erase(self);
+        ActorSwingRig_Destroy_Orig(self, mtd);
+    }
+#endif
+
     void StartInjectFunctions() {
         const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
 
@@ -6499,6 +6654,16 @@ namespace HoshimiLocal::HookMain {
                          GetBreastBones_mtd->methodPointer);
             }
         }
+
+        ADD_HOOK(ActorSwingRig_UpdateConstraints,
+                 Il2cppUtils::GetMethodPointer("ActorSwing.Runtime.dll", "ActorSwing", "ActorSwingRig",
+                                               "UpdateConstraints"));
+        ADD_HOOK(ActorSwingRig_ResetBreastBone,
+                 Il2cppUtils::GetMethodPointer("ActorSwing.Runtime.dll", "ActorSwing", "ActorSwingRig",
+                                               "ResetBreastBone"));
+        ADD_HOOK(ActorSwingRig_Destroy,
+                 Il2cppUtils::GetMethodPointer("ActorSwing.Runtime.dll", "ActorSwing", "ActorSwingRig",
+                                               "Destroy"));
 #endif
 
         PrivateServer::Install(hookInstaller);

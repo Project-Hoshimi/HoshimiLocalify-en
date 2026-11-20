@@ -136,6 +136,23 @@ fun AdvanceSettingsPage(modifier: Modifier = Modifier,
                             ) { v -> context?.onEnableBreastParamChanged(v) }
                         }
                         item {
+                            IPSwitch(modifier = modifier,
+                                checked = config.value.bLockPhysicsFps,
+                                text = stringResource(R.string.lock_physics_fps)
+                            ) { v -> context?.onBLockPhysicsFpsChanged(v) }
+                        }
+                        item {
+                            IPTextInput(modifier = modifier
+                                .height(45.dp)
+                                .fillMaxWidth(),
+                                fontSize = 14f,
+                                value = config.value.bPhysicsFps.toString(),
+                                onValueChange = { c -> context?.onBPhysicsFpsChanged(c, 0, 0, 0)},
+                                label = { Text(stringResource(R.string.physics_fps)) },
+                                keyboardOptions = keyBoardOptionsDecimal
+                            )
+                        }
+                        item {
                             Row(modifier = modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                 val buttonModifier = remember {

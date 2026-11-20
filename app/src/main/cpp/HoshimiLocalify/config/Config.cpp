@@ -70,6 +70,8 @@ namespace HoshimiLocal::Config {
     float bLimitYy = 5.0f;
     float bLimitZx = 5.0f;
     float bLimitZy = 5.0f;
+    bool bLockPhysicsFps = true;
+    int bPhysicsFps = 30;
 
     bool dmmUnlockSize = false;
 
@@ -153,6 +155,8 @@ namespace HoshimiLocal::Config {
             GetConfigItem(bLimitYy);
             GetConfigItem(bLimitZx);
             GetConfigItem(bLimitZy);
+            GetConfigItem(bLockPhysicsFps);
+            GetConfigItem(bPhysicsFps);
             GetConfigItem(dmmUnlockSize);
         }
         catch (std::exception& e) {
@@ -224,6 +228,8 @@ namespace HoshimiLocal::Config {
             SetConfigItem(bLimitYy);
             SetConfigItem(bLimitZx);
             SetConfigItem(bLimitZy);
+            SetConfigItem(bLockPhysicsFps);
+            SetConfigItem(bPhysicsFps);
             SetConfigItem(dmmUnlockSize);
 
             std::ofstream out(configPath);

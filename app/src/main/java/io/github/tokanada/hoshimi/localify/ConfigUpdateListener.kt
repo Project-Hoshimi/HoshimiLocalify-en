@@ -74,6 +74,8 @@ interface ConfigListener {
     fun onBScaleChanged(s: CharSequence, start: Int, before: Int, count: Int)
     fun onBUseArmCorrectionChanged(value: Boolean)
     fun onBUseScaleChanged(value: Boolean)
+    fun onBLockPhysicsFpsChanged(value: Boolean)
+    fun onBPhysicsFpsChanged(s: CharSequence, start: Int, before: Int, count: Int)
     fun onBClickPresetChanged(index: Int)
     fun onPUseBuiltInAssetsChanged(value: Boolean)
     fun onPCleanLocalAssetsChanged(value: Boolean)
@@ -379,6 +381,22 @@ override fun onUnlockAllLiveCostumeChanged(value: Boolean) {
         config.bUseScale = value
         saveConfig()
         checkConfigAndUpdateView()
+    }
+
+    override fun onBLockPhysicsFpsChanged(value: Boolean) {
+        config.bLockPhysicsFps = value
+        saveConfig()
+        checkConfigAndUpdateView()
+    }
+
+    override fun onBPhysicsFpsChanged(s: CharSequence, start: Int, before: Int, count: Int) {
+        config.bPhysicsFps = try {
+            s.toString().toInt().coerceIn(1, 240)
+        }
+        catch (e: Exception) {
+            30
+        }
+        saveConfig()
     }
 
     override fun onBDampingChanged(s: CharSequence, start: Int, before: Int, count: Int) {
