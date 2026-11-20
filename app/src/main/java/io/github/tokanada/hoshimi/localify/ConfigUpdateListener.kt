@@ -77,6 +77,7 @@ interface ConfigListener {
     fun onBLockPhysicsFpsChanged(value: Boolean)
     fun onBPhysicsFpsChanged(s: CharSequence, start: Int, before: Int, count: Int)
     fun onBClickPresetChanged(index: Int)
+    fun onBResetToDefaults()
     fun onPUseBuiltInAssetsChanged(value: Boolean)
     fun onPCleanLocalAssetsChanged(value: Boolean)
     fun mainPageAssetsViewDataUpdate(downloadAbleState: Boolean? = null,
@@ -588,6 +589,33 @@ override fun onUnlockAllLiveCostumeChanged(value: Boolean) {
         }
 
         config.bUseArmCorrection = true
+
+        checkConfigAndUpdateView()
+        saveConfig()
+    }
+
+    override fun onBResetToDefaults() {
+        // Restore every breast physics param to the shipped defaults; the master enable switch is left as-is.
+        val d = IdolyprideConfig()
+        config.bDamping = d.bDamping
+        config.bStiffness = d.bStiffness
+        config.bSpring = d.bSpring
+        config.bPendulum = d.bPendulum
+        config.bPendulumRange = d.bPendulumRange
+        config.bAverage = d.bAverage
+        config.bRootWeight = d.bRootWeight
+        config.bUseArmCorrection = d.bUseArmCorrection
+        config.bUseScale = d.bUseScale
+        config.bScale = d.bScale
+        config.bUseLimit = d.bUseLimit
+        config.bLimitXx = d.bLimitXx
+        config.bLimitXy = d.bLimitXy
+        config.bLimitYx = d.bLimitYx
+        config.bLimitYy = d.bLimitYy
+        config.bLimitZx = d.bLimitZx
+        config.bLimitZy = d.bLimitZy
+        config.bLockPhysicsFps = d.bLockPhysicsFps
+        config.bPhysicsFps = d.bPhysicsFps
 
         checkConfigAndUpdateView()
         saveConfig()
