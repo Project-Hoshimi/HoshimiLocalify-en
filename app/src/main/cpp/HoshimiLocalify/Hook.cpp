@@ -2929,7 +2929,8 @@ namespace HoshimiLocal::HookMain {
     void* CreateGameObject(const std::string& name) {
         auto klass = Il2cppUtils::GetClass("UnityEngine.CoreModule.dll", "UnityEngine", "GameObject");
         if (!klass) return nullptr;
-        auto obj = UnityResolve::Invoke<void*>("il2cpp_object_new", klass);
+        // klass is the UnityResolve wrapper; New() passes its raw Il2CppClass to il2cpp_object_new.
+        auto obj = klass->New<void>();
         if (!obj) return nullptr;
         UnityResolve::UnityType::GameObject::Create(static_cast<UnityResolve::UnityType::GameObject*>(obj), name);
         return obj;
