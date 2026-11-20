@@ -37,6 +37,10 @@
     <string name="orientation_landscape">가로 화면</string>
     <string name="orientation_lock">화면 방향 고정</string>
     <string name="enable_breast_param">바스트 파라미터 활성화</string>
+    <string name="lock_physics_fps">바스트 물리 속도 고정</string>
+    <string name="physics_fps">물리 FPS</string>
+    <string name="reset_breast_param">바스트 파라미터 초기화</string>
+    <string name="reset_breast_param_confirm">바스트 파라미터를 모두 기본값으로 초기화할까요?</string>
     <string name="damping">감쇄 (Damping)</string>
     <string name="stiffness">강도 (Stiffness)</string>
     <string name="spring">탄성 (Spring)</string>

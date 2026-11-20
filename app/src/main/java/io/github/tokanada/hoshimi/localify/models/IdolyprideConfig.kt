@@ -65,6 +65,8 @@ data class IdolyprideConfig (
     var bLimitYy: Float = 5.0f,
     var bLimitZx: Float = 5.0f,
     var bLimitZy: Float = 5.0f,
+    var bLockPhysicsFps: Boolean = true,
+    var bPhysicsFps: Int = 30,
 
     var pf: Boolean = false
 )

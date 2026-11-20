@@ -68,6 +68,8 @@ namespace HoshimiLocal::Config {
     extern float bLimitYy;
     extern float bLimitZx;
     extern float bLimitZy;
+    extern bool bLockPhysicsFps;
+    extern int bPhysicsFps;
 
     extern bool dmmUnlockSize;
 
