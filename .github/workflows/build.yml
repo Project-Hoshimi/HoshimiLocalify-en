@@ -5,11 +5,14 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   repository_dispatch:
     types:
       - data-release
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "23 4 * * *"
 
 concurrency:
   group: module-release
@@ -19,49 +22,34 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build release APKs
+  check:
+    name: Check release state
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'repository_dispatch' || github.event.action == 'data-release' }}
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+      version_name: ${{ steps.app_version.outputs.version_name }}
+      data_tag: ${{ steps.data.outputs.data_tag }}
+      release_tag: ${{ steps.data.outputs.release_tag }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Set up JDK
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-
-      - name: Install Android SDK components
-        run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;26.3.11579264" \
-            "cmake;3.22.1"
-
       - name: Read app version
         id: app_version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          version_name="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle | head -n 1)"
+          version_name="$(gh api "repos/$GITHUB_REPOSITORY/contents/app/build.gradle?ref=$GITHUB_SHA" -H "Accept: application/vnd.github.raw" | sed -n 's/^[[:space:]]*versionName[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
           if [ -z "$version_name" ]; then
             echo "versionName was not found in app/build.gradle" >&2
             exit 1
           fi
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch EN translation data
+      - name: Resolve translation data release tag
         id: data
         env:
           GH_TOKEN: ${{ github.token }}
           PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          VERSION_NAME: ${{ steps.app_version.outputs.version_name }}
         run: |
           set -euo pipefail
           ver="${PAYLOAD_TAG:-}"
@@ -78,32 +66,72 @@ jobs:
           fi
           if [ -z "$ver" ] || [ "$ver" = "null" ]; then echo "Could not read latest data release tag" >&2; exit 1; fi
           echo "Using data release $ver"
-          curl -fL --retry 3 --retry-delay 5 -o /tmp/en.zip "https://github.com/Project-Hoshimi/ipr-translation-data-en/releases/download/$ver/ipr-translation-data-en-$ver.zip"
-          mkdir -p app/src/main/assets/hoshimi-local
-          unzip -qo /tmp/en.zip -d app/src/main/assets/hoshimi-local
           echo "data_tag=$ver" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${{ steps.app_version.outputs.version_name }}-data.$ver" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$VERSION_NAME-data.$ver" >> "$GITHUB_OUTPUT"
 
       - name: Skip if this module+data release already exists
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ steps.data.outputs.release_tag }}
         run: |
-          tag="${{ steps.data.outputs.release_tag }}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-             && [ "${{ github.event_name }}" != "push" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "Release $tag already exists; nothing to do."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+             && [ "$EVENT_NAME" != "push" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "Release $TAG already exists; nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+  build:
+    name: Build release APKs
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          missing=()
+          if [ ! -d "$ANDROID_HOME/platforms/android-34" ]; then missing+=("platforms;android-34"); fi
+          if [ ! -d "$ANDROID_HOME/build-tools/34.0.0" ]; then missing+=("build-tools;34.0.0"); fi
+          if [ ! -d "$ANDROID_HOME/ndk/26.3.11579264" ]; then missing+=("ndk;26.3.11579264"); fi
+          if [ ! -d "$ANDROID_HOME/cmake/3.22.1" ]; then missing+=("cmake;3.22.1"); fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "${missing[@]}"
+          else
+            echo "All required Android SDK components are preinstalled."
+          fi
+
+      - name: Fetch EN translation data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ needs.check.outputs.data_tag }}
+        run: |
+          set -euo pipefail
+          echo "Using data release $DATA_TAG"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/en.zip "https://github.com/Project-Hoshimi/ipr-translation-data-en/releases/download/$DATA_TAG/ipr-translation-data-en-$DATA_TAG.zip"
+          mkdir -p app/src/main/assets/hoshimi-local
+          unzip -qo /tmp/en.zip -d app/src/main/assets/hoshimi-local
+
       - name: Grant execute permission for Gradle wrapper
-        if: steps.gate.outputs.skip != 'true'
         run: chmod +x gradlew
 
       - name: Restore release keystore
-        if: steps.gate.outputs.skip != 'true'
         env:
           HOSHIMI_RELEASE_KEYSTORE_BASE64: ${{ secrets.HOSHIMI_RELEASE_KEYSTORE_BASE64 }}
         run: |
@@ -112,30 +140,31 @@ jobs:
           fi
 
       - name: Build APKs
-        if: steps.gate.outputs.skip != 'true'
         env:
           HOSHIMI_RELEASE_STORE_FILE: release.keystore
           HOSHIMI_RELEASE_STORE_PASSWORD: ${{ secrets.HOSHIMI_RELEASE_STORE_PASSWORD }}
           HOSHIMI_RELEASE_KEY_ALIAS: ${{ secrets.HOSHIMI_RELEASE_KEY_ALIAS }}
           HOSHIMI_RELEASE_KEY_PASSWORD: ${{ secrets.HOSHIMI_RELEASE_KEY_PASSWORD }}
-        run: ./gradlew clean assembleRelease
+        run: ./gradlew assembleRelease
 
       - name: Rename APKs
-        if: steps.gate.outputs.skip != 'true'
+        env:
+          TAG: ${{ needs.check.outputs.release_tag }}
         run: |
-          t="${{ steps.data.outputs.release_tag }}"
-          mv app/build/outputs/apk/full/release/app-full-release.apk "HoshimiLocalify-en-full-$t.apk"
-          mv app/build/outputs/apk/lite/release/app-lite-release.apk "HoshimiLocalify-en-lite-$t.apk"
+          mv app/build/outputs/apk/full/release/app-full-release.apk "HoshimiLocalify-en-full-$TAG.apk"
+          mv app/build/outputs/apk/lite/release/app-lite-release.apk "HoshimiLocalify-en-lite-$TAG.apk"
 
       - name: Publish release
-        if: steps.gate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+          VERSION_NAME: ${{ needs.check.outputs.version_name }}
+          DATA_TAG: ${{ needs.check.outputs.data_tag }}
         run: |
           set -euo pipefail
-          t="${{ steps.data.outputs.release_tag }}"
-          v="${{ steps.app_version.outputs.version_name }}"
-          d="${{ steps.data.outputs.data_tag }}"
+          t="$TAG"
+          v="$VERSION_NAME"
+          d="$DATA_TAG"
           notes="Module $v with translation data $d (commit $GITHUB_SHA)."
           files=("HoshimiLocalify-en-full-$t.apk" "HoshimiLocalify-en-lite-$t.apk")
           if gh release view "$t" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -147,7 +176,6 @@ jobs:
           fi
 
       - name: Prune old data releases (keep newest 7)
-        if: steps.gate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
